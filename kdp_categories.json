@@ -1,0 +1,935 @@
+{
+  "scraped_at": "2026-09-14",
+  "source": "KDP「Choose categories」弹层（Kindle eBook, Amazon.com）",
+  "note": "placements 为该一级分类下可直接勾选的最终位置；空列表表示必须先选子分类，本流程不支持",
+  "categories": {
+    "Arts & Photography": {
+      "nodeId": "154607011",
+      "placements": [
+        {
+          "name": "Disability",
+          "nodeId": "214873923011"
+        },
+        {
+          "name": "Fashion",
+          "nodeId": "154656011"
+        },
+        {
+          "name": "General",
+          "nodeId": "676934011"
+        },
+        {
+          "name": "Individual Artists",
+          "nodeId": "154655011"
+        }
+      ]
+    },
+    "Biographies & Memoirs": {
+      "nodeId": "154754011",
+      "placements": [
+        {
+          "name": "General",
+          "nodeId": "154780011"
+        },
+        {
+          "name": "LGBTQ+",
+          "nodeId": "156425011"
+        },
+        {
+          "name": "Memoirs",
+          "nodeId": "154793011"
+        },
+        {
+          "name": "People with Disabilities",
+          "nodeId": "10332449011"
+        },
+        {
+          "name": "Reference & Collections",
+          "nodeId": "154806011"
+        },
+        {
+          "name": "Survival",
+          "nodeId": "17744489011"
+        },
+        {
+          "name": "Travel",
+          "nodeId": "154820011"
+        },
+        {
+          "name": "Women",
+          "nodeId": "154819011"
+        }
+      ]
+    },
+    "Business & Money": {
+      "nodeId": "154821011",
+      "placements": [
+        {
+          "name": "Bitcoin & Cryptocurrencies",
+          "nodeId": "203569024011"
+        },
+        {
+          "name": "General",
+          "nodeId": "154878011"
+        },
+        {
+          "name": "Green Business",
+          "nodeId": "8493746011"
+        },
+        {
+          "name": "Women & Business",
+          "nodeId": "154829011"
+        }
+      ]
+    },
+    "Children's eBooks": {
+      "nodeId": "155009011",
+      "placements": []
+    },
+    "Comics, Manga & Graphic Novels": {
+      "nodeId": "156104011",
+      "placements": [
+        {
+          "name": "Art Books",
+          "nodeId": "7290670011"
+        },
+        {
+          "name": "Comic Strips & Cartoons",
+          "nodeId": "2231074011"
+        },
+        {
+          "name": "General",
+          "nodeId": "2231075011"
+        },
+        {
+          "name": "Manhua",
+          "nodeId": "206809965011"
+        },
+        {
+          "name": "Manhwa",
+          "nodeId": "206809964011"
+        },
+        {
+          "name": "Superhero Graphic Novels",
+          "nodeId": "11468695011"
+        }
+      ]
+    },
+    "Computers & Technology": {
+      "nodeId": "156116011",
+      "placements": [
+        {
+          "name": "Computerized Home & Entertainment",
+          "nodeId": "16977190011"
+        },
+        {
+          "name": "Embedded Computer Systems",
+          "nodeId": "18623128011"
+        },
+        {
+          "name": "General",
+          "nodeId": "156120011"
+        },
+        {
+          "name": "Interactive & Multimedia",
+          "nodeId": "16977221011"
+        }
+      ]
+    },
+    "Cookbooks, Food & Wine": {
+      "nodeId": "156154011",
+      "placements": [
+        {
+          "name": "Media Tie-In",
+          "nodeId": "17744511011"
+        },
+        {
+          "name": "Comfort Food",
+          "nodeId": "17744513011"
+        },
+        {
+          "name": "Canning & Preserving",
+          "nodeId": "156166011"
+        },
+        {
+          "name": "Culinary Arts & Techniques",
+          "nodeId": "156179011"
+        },
+        {
+          "name": "General",
+          "nodeId": "156189011"
+        },
+        {
+          "name": "Low Budget",
+          "nodeId": "6361580011"
+        },
+        {
+          "name": "Natural Foods",
+          "nodeId": "156195011"
+        },
+        {
+          "name": "Reference",
+          "nodeId": "156206011"
+        }
+      ]
+    },
+    "Crafts, Hobbies & Home": {
+      "nodeId": "156699011",
+      "placements": [
+        {
+          "name": "General",
+          "nodeId": "676943011"
+        },
+        {
+          "name": "Weddings",
+          "nodeId": "156914011"
+        }
+      ]
+    },
+    "Education & Teaching": {
+      "nodeId": "158125011",
+      "placements": [
+        {
+          "name": "Education",
+          "nodeId": "158147011"
+        }
+      ]
+    },
+    "Engineering & Transportation": {
+      "nodeId": "157626011",
+      "placements": []
+    },
+    "Foreign Languages": {
+      "nodeId": "7735160011",
+      "placements": [
+        {
+          "name": "Chinese (Traditional)",
+          "nodeId": "18327575011"
+        }
+      ]
+    },
+    "Health, Fitness & Dieting": {
+      "nodeId": "156430011",
+      "placements": [
+        {
+          "name": "General",
+          "nodeId": "156486011"
+        },
+        {
+          "name": "Reference",
+          "nodeId": "156555011"
+        },
+        {
+          "name": "Sex",
+          "nodeId": "156575011"
+        },
+        {
+          "name": "Sports Health & Safety",
+          "nodeId": "11717492011"
+        },
+        {
+          "name": "Teen Health",
+          "nodeId": "11717493011"
+        }
+      ]
+    },
+    "History": {
+      "nodeId": "156576011",
+      "placements": [
+        {
+          "name": "Food & Cooking",
+          "nodeId": "156188011"
+        },
+        {
+          "name": "General",
+          "nodeId": "676941011"
+        },
+        {
+          "name": "Hispanic & Latino",
+          "nodeId": "206810087011"
+        },
+        {
+          "name": "Indigenous",
+          "nodeId": "206810086011"
+        },
+        {
+          "name": "Maritime History & Piracy",
+          "nodeId": "11650869011"
+        },
+        {
+          "name": "Polar Regions",
+          "nodeId": "156635011"
+        },
+        {
+          "name": "Russia",
+          "nodeId": "156679011"
+        },
+        {
+          "name": "Women in History",
+          "nodeId": "10704244011"
+        }
+      ]
+    },
+    "Humor & Entertainment": {
+      "nodeId": "156279011",
+      "placements": []
+    },
+    "LGBTQ+ eBooks": {
+      "nodeId": "156424011",
+      "placements": [
+        {
+          "name": "Biographies & Memoirs",
+          "nodeId": "156425011"
+        },
+        {
+          "name": "Drama & Plays",
+          "nodeId": "10886539011"
+        },
+        {
+          "name": "LGBTQ+ Parenting & Families",
+          "nodeId": "18623137011"
+        },
+        {
+          "name": "Mystery & Detective",
+          "nodeId": "7130633011"
+        },
+        {
+          "name": "Poetry",
+          "nodeId": "6361450011"
+        },
+        {
+          "name": "Politics",
+          "nodeId": "10886547011"
+        },
+        {
+          "name": "Travel",
+          "nodeId": "10886546011"
+        }
+      ]
+    },
+    "Law": {
+      "nodeId": "156915011",
+      "placements": [
+        {
+          "name": "Dictionaries & Terminology",
+          "nodeId": "156953011"
+        },
+        {
+          "name": "Ethics & Professional Responsibility",
+          "nodeId": "156955011"
+        },
+        {
+          "name": "General",
+          "nodeId": "156967011"
+        },
+        {
+          "name": "International Law",
+          "nodeId": "156973011"
+        },
+        {
+          "name": "Legal Education",
+          "nodeId": "156983011"
+        },
+        {
+          "name": "Media & the Law",
+          "nodeId": "156984011"
+        }
+      ]
+    },
+    "Literature & Fiction": {
+      "nodeId": "157028011",
+      "placements": [
+        {
+          "name": "Absurdist",
+          "nodeId": "14530448011"
+        },
+        {
+          "name": "Adaptations & Pastiche",
+          "nodeId": "18623138011"
+        },
+        {
+          "name": "Animals",
+          "nodeId": "16232447011"
+        },
+        {
+          "name": "General",
+          "nodeId": "157049011"
+        },
+        {
+          "name": "Immigration",
+          "nodeId": "206810181011"
+        },
+        {
+          "name": "Indigenous",
+          "nodeId": "206810180011"
+        },
+        {
+          "name": "Own Voices",
+          "nodeId": "23504856011"
+        },
+        {
+          "name": "People with Disabilities",
+          "nodeId": "24046916011"
+        },
+        {
+          "name": "Small Town & Rural",
+          "nodeId": "14530449011"
+        },
+        {
+          "name": "Suburban",
+          "nodeId": "206810182011"
+        }
+      ]
+    },
+    "Medical eBooks": {
+      "nodeId": "157119011",
+      "placements": [
+        {
+          "name": "Environmental Health",
+          "nodeId": "18623139011"
+        },
+        {
+          "name": "Informatics",
+          "nodeId": "18623140011"
+        },
+        {
+          "name": "Military Medicine",
+          "nodeId": "18623147011"
+        },
+        {
+          "name": "General",
+          "nodeId": "157181011"
+        },
+        {
+          "name": "Radiology",
+          "nodeId": "6361603011"
+        },
+        {
+          "name": "Reproductive Medicine & Technology",
+          "nodeId": "157254011"
+        }
+      ]
+    },
+    "Mystery, Thriller & Suspense": {
+      "nodeId": "157305011",
+      "placements": [
+        {
+          "name": "General",
+          "nodeId": "157306011"
+        },
+        {
+          "name": "Science Fiction",
+          "nodeId": "18623156011"
+        }
+      ]
+    },
+    "Nonfiction": {
+      "nodeId": "157325011",
+      "placements": [
+        {
+          "name": "General",
+          "nodeId": "676946011"
+        }
+      ]
+    },
+    "Parenting & Relationships": {
+      "nodeId": "157584011",
+      "placements": [
+        {
+          "name": "LGBTQ+ Parenting & Families",
+          "nodeId": "18623137011"
+        },
+        {
+          "name": "Adoption",
+          "nodeId": "157585011"
+        },
+        {
+          "name": "Family Activities",
+          "nodeId": "157590011"
+        },
+        {
+          "name": "Family Health",
+          "nodeId": "157591011"
+        },
+        {
+          "name": "Fertility & Infertility",
+          "nodeId": "157602011"
+        },
+        {
+          "name": "General",
+          "nodeId": "157603011"
+        },
+        {
+          "name": "Literature Guides",
+          "nodeId": "157604011"
+        },
+        {
+          "name": "Reference",
+          "nodeId": "157621011"
+        }
+      ]
+    },
+    "Politics & Social Sciences": {
+      "nodeId": "305951011",
+      "placements": [
+        {
+          "name": "General",
+          "nodeId": "676949011"
+        }
+      ]
+    },
+    "Reference": {
+      "nodeId": "9154158011",
+      "placements": [
+        {
+          "name": "Consumer Guides",
+          "nodeId": "158142011"
+        },
+        {
+          "name": "Encyclopedias",
+          "nodeId": "158188011"
+        },
+        {
+          "name": "General",
+          "nodeId": "158233011"
+        },
+        {
+          "name": "Personal & Private Investigations",
+          "nodeId": "17744516011"
+        },
+        {
+          "name": "Quotations",
+          "nodeId": "158238011"
+        },
+        {
+          "name": "Signs & Symbols",
+          "nodeId": "17744517011"
+        }
+      ]
+    },
+    "Religion & Spirituality": {
+      "nodeId": "158280011",
+      "placements": [
+        {
+          "name": "Agnosticism",
+          "nodeId": "158552011"
+        },
+        {
+          "name": "Atheism",
+          "nodeId": "158554011"
+        },
+        {
+          "name": "Creation",
+          "nodeId": "206810142011"
+        },
+        {
+          "name": "General",
+          "nodeId": "158441011"
+        }
+      ]
+    },
+    "Romance": {
+      "nodeId": "158566011",
+      "placements": [
+        {
+          "name": "Action & Adventure",
+          "nodeId": "11650866011"
+        },
+        {
+          "name": "Adaptations",
+          "nodeId": "120220978011"
+        },
+        {
+          "name": "Alpha Male",
+          "nodeId": "120220980011"
+        },
+        {
+          "name": "Amish & Mennonite",
+          "nodeId": "6487833011"
+        },
+        {
+          "name": "Billionaires & Millionaires",
+          "nodeId": "120220974011"
+        },
+        {
+          "name": "Black & African American",
+          "nodeId": "6190465011"
+        },
+        {
+          "name": "Clean & Wholesome",
+          "nodeId": "11650867011"
+        },
+        {
+          "name": "Collections & Anthologies",
+          "nodeId": "6190486011"
+        },
+        {
+          "name": "Contemporary",
+          "nodeId": "158568011"
+        },
+        {
+          "name": "Dark Romance",
+          "nodeId": "214873907011"
+        },
+        {
+          "name": "Enemies to Lovers",
+          "nodeId": "120220977011"
+        },
+        {
+          "name": "Erotica",
+          "nodeId": "6190478011"
+        },
+        {
+          "name": "Fake Dating",
+          "nodeId": "214873906011"
+        },
+        {
+          "name": "Firefighters",
+          "nodeId": "120220985011"
+        },
+        {
+          "name": "Friends to Lovers",
+          "nodeId": "214873904011"
+        },
+        {
+          "name": "General",
+          "nodeId": "158570011"
+        },
+        {
+          "name": "Gothic",
+          "nodeId": "6487830011"
+        },
+        {
+          "name": "Hispanic & Latino",
+          "nodeId": "206810016011"
+        },
+        {
+          "name": "Indigenous",
+          "nodeId": "206810017011"
+        },
+        {
+          "name": "Later in Life",
+          "nodeId": "17744544011"
+        },
+        {
+          "name": "Love Triangle",
+          "nodeId": "120220976011"
+        },
+        {
+          "name": "Mafia Romance",
+          "nodeId": "120220975011"
+        },
+        {
+          "name": "Medical",
+          "nodeId": "17744545011"
+        },
+        {
+          "name": "Military",
+          "nodeId": "6487836011"
+        },
+        {
+          "name": "Multicultural & Interracial",
+          "nodeId": "6487837011"
+        },
+        {
+          "name": "New Adult & College Romance",
+          "nodeId": "6487838011"
+        },
+        {
+          "name": "Police",
+          "nodeId": "120220986011"
+        },
+        {
+          "name": "Polyamory",
+          "nodeId": "120220982011"
+        },
+        {
+          "name": "Rockstar Romance",
+          "nodeId": "96711267011"
+        },
+        {
+          "name": "Romantasy",
+          "nodeId": "158569011"
+        },
+        {
+          "name": "Romantic Comedy",
+          "nodeId": "6487841011"
+        },
+        {
+          "name": "Science Fiction",
+          "nodeId": "6401744011"
+        },
+        {
+          "name": "Second Chances",
+          "nodeId": "214873905011"
+        },
+        {
+          "name": "Small Town Romance",
+          "nodeId": "120220981011"
+        },
+        {
+          "name": "Sports",
+          "nodeId": "6487842011"
+        },
+        {
+          "name": "Time Travel",
+          "nodeId": "6190487011"
+        },
+        {
+          "name": "Western & Frontier",
+          "nodeId": "6190489011"
+        },
+        {
+          "name": "Workplace Romance",
+          "nodeId": "120220979011"
+        }
+      ]
+    },
+    "Science & Math": {
+      "nodeId": "158597011",
+      "placements": [
+        {
+          "name": "Essays & Commentary",
+          "nodeId": "158690011"
+        },
+        {
+          "name": "Ethics",
+          "nodeId": "17744551011"
+        },
+        {
+          "name": "General",
+          "nodeId": "158700011"
+        },
+        {
+          "name": "Genetics",
+          "nodeId": "158701011"
+        }
+      ]
+    },
+    "Science Fiction & Fantasy": {
+      "nodeId": "668010011",
+      "placements": []
+    },
+    "Self-Help": {
+      "nodeId": "156563011",
+      "placements": [
+        {
+          "name": "Abuse",
+          "nodeId": "156496011"
+        },
+        {
+          "name": "Affirmations",
+          "nodeId": "202437591011"
+        },
+        {
+          "name": "Aging",
+          "nodeId": "202437597011"
+        },
+        {
+          "name": "Anger Management",
+          "nodeId": "202437593011"
+        },
+        {
+          "name": "Anxieties & Phobias",
+          "nodeId": "202437592011"
+        },
+        {
+          "name": "Communication & Social Skills",
+          "nodeId": "202437599011"
+        },
+        {
+          "name": "Creativity",
+          "nodeId": "156564011"
+        },
+        {
+          "name": "Eating Disorders & Body Image",
+          "nodeId": "10668115011"
+        },
+        {
+          "name": "Emotions",
+          "nodeId": "202437588011"
+        },
+        {
+          "name": "Fashion & Style",
+          "nodeId": "202437596011"
+        },
+        {
+          "name": "General",
+          "nodeId": "156565011"
+        },
+        {
+          "name": "Green Lifestyle",
+          "nodeId": "202437602011"
+        },
+        {
+          "name": "Happiness",
+          "nodeId": "156566011"
+        },
+        {
+          "name": "Indigenous Mental Health & Healing",
+          "nodeId": "206810072011"
+        },
+        {
+          "name": "Inner Child",
+          "nodeId": "156567011"
+        },
+        {
+          "name": "Journal Writing",
+          "nodeId": "156568011"
+        },
+        {
+          "name": "Journaling",
+          "nodeId": "11650899011"
+        },
+        {
+          "name": "Memory Improvement",
+          "nodeId": "156569011"
+        },
+        {
+          "name": "Motivational",
+          "nodeId": "156570011"
+        },
+        {
+          "name": "Neuro-Linguistic Programming (NLP)",
+          "nodeId": "202437594011"
+        },
+        {
+          "name": "Personal Transformation",
+          "nodeId": "156571011"
+        },
+        {
+          "name": "Self-Esteem",
+          "nodeId": "156572011"
+        },
+        {
+          "name": "Self-Hypnosis",
+          "nodeId": "202437595011"
+        },
+        {
+          "name": "Self-Management",
+          "nodeId": "202437601011"
+        },
+        {
+          "name": "Sexual Instruction",
+          "nodeId": "202437590011"
+        },
+        {
+          "name": "Spiritual",
+          "nodeId": "156573011"
+        },
+        {
+          "name": "Stress Management",
+          "nodeId": "156574011"
+        },
+        {
+          "name": "Success",
+          "nodeId": "202437600011"
+        },
+        {
+          "name": "Time Management",
+          "nodeId": "202437598011"
+        }
+      ]
+    },
+    "Sports & Outdoors": {
+      "nodeId": "159818011",
+      "placements": [
+        {
+          "name": "Extreme Sports",
+          "nodeId": "159840011"
+        },
+        {
+          "name": "General",
+          "nodeId": "159845011"
+        },
+        {
+          "name": "Golf",
+          "nodeId": "159846011"
+        },
+        {
+          "name": "Hockey",
+          "nodeId": "159847011"
+        },
+        {
+          "name": "Mountaineering",
+          "nodeId": "159882011"
+        },
+        {
+          "name": "Olympics & Paralympics",
+          "nodeId": "11650903011"
+        },
+        {
+          "name": "Poker",
+          "nodeId": "156386011"
+        },
+        {
+          "name": "Rodeos",
+          "nodeId": "159895011"
+        },
+        {
+          "name": "Soccer",
+          "nodeId": "159896011"
+        },
+        {
+          "name": "Softball",
+          "nodeId": "159897011"
+        }
+      ]
+    },
+    "Teen & Young Adult": {
+      "nodeId": "3511261011",
+      "placements": [
+        {
+          "name": "General",
+          "nodeId": "15248963011"
+        },
+        {
+          "name": "Humor",
+          "nodeId": "15248990011"
+        },
+        {
+          "name": "Travel",
+          "nodeId": "15249212011"
+        }
+      ]
+    },
+    "Travel": {
+      "nodeId": "159936011",
+      "placements": [
+        {
+          "name": "Caribbean",
+          "nodeId": "159945011"
+        },
+        {
+          "name": "General",
+          "nodeId": "159958011"
+        },
+        {
+          "name": "Pictorial",
+          "nodeId": "159967011"
+        },
+        {
+          "name": "Polar Regions",
+          "nodeId": "14046450011"
+        },
+        {
+          "name": "Russia",
+          "nodeId": "14046405011"
+        },
+        {
+          "name": "Travel Writing",
+          "nodeId": "159960011"
+        }
+      ]
+    },
+    "Non-Classifiable": {
+      "nodeId": "NON_CLASSIFIABLE",
+      "placements": [
+        {
+          "name": "Non-Classifiable",
+          "nodeId": null
+        }
+      ]
+    }
+  }
+}

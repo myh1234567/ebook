@@ -1,0 +1,33 @@
+# ---- 密钥，绝对不能提交 ----
+# Google 服务账号私钥。文件名是 Google 随机生成的（项目名-随机串.json），
+# 所以按内容特征挡不住，这里把常见形态都列上。
+kdp-writer-*.json
+*-service-account*.json
+service_account*.json
+sa.json
+client_secret*.json
+gdrive_token.json
+credentials.json
+
+# ---- 每台机器各不相同，同步过去反而会覆盖对方配好的东西 ----
+# 路径是绝对路径（/Users/xxx/...），换台机器必然不存在；
+# llm_api_key 也在这里面。用 settings.example.json 做模板。
+settings.json
+
+# ---- 运行时状态，各机器独立 ----
+batch_state.json
+running_task.pid
+running_task.log
+_claims/
+_drive_cache/
+
+# ---- 产物与缓存 ----
+output/
+kdp_probe/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ---- 系统 ----
+.DS_Store
