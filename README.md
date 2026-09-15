@@ -4,11 +4,14 @@
 
 | 页签 | 做什么 |
 |---|---|
-| **助眠视频** | txt 文案 → 慢速朗读 → 背景视频循环 → 配乐垫底 → ffmpeg 成片 → 上传 YouTube |
 | **小说改编** | 中文小说 → 跨文化改编成英文小说 → 产出 Amazon KDP 全套出版物料 |
-| **KDP 上架** | 物料预检 → 字段一键复制 → Chrome 自动填表 |
+| **批量队列** | Google Drive 文件夹里一堆 txt，一本一本自动跑完 |
+| **KDP 上架** | 物料预检 → Chrome 全自动填表、上传、定价，可选自动发布 |
+| **助眠视频** | txt 文案 → 慢速朗读 → 背景视频循环 → 配乐垫底 → ffmpeg 成片 → 上传 YouTube |
 
-三个页签共用底部的进度条和日志，同一时间只跑一个任务，「停止」对三者都生效。
+页签共用右栏的进度条和日志，同一时间只跑一个任务，「停止」对所有页签都生效。
+
+长任务（一本书几小时）更推荐用命令行跑，见下面的 [命令行](#命令行)。
 
 ## 跑起来
 
@@ -33,8 +36,24 @@ brew install ffmpeg              # 已装可跳过
 
 ### 小说改编
 
-选中文小说 txt，填好改编设定（目标国家、年代、类型）和书籍信息，填上大模型
-API Key，点**开始改编**。产出落在 `输出目录/书名/` 下：
+选中文小说 txt，配好[大模型](#大模型怎么配)，点**开始改编**。改编设定
+（目标国家、年代、类型、受众）默认自动识别，不用手填；书名从改编档案里自动取。
+
+流程分三段：
+
+```text
+1. 通读全书   全书按 6 万字分块 → 每块提取人物/术语/情节/伏笔 → 汇总（并行）
+2. 生成档案   基于全书总结建改编档案：人物映射表、术语对照表、连续性追踪
+3. 逐章改编   每章输入 = 完整改编档案 + 本章完整原文（并行）
+```
+
+第 1 段是必要的：档案要给 800 章定人物名和术语，只看前几章必然在后期漂。
+它落盘在 `_summaries/`，重跑复用，成本不付第二次。
+
+章节之间**互不依赖**（每章只看档案 + 自己的原文），所以并行产出和串行逐字相同，
+只是快 N 倍。并发数在界面「章节并发数」里调。
+
+产出落在 `输出目录/书名/` 下：
 
 ```text
 01_English_Manuscript.docx   完整英文母稿（Heading 1 章标题，Kindle 能自动生成目录）
@@ -63,12 +82,135 @@ API Key，点**开始改编**。产出落在 `输出目录/书名/` 下：
 1. **读取并预检** —— 解析元数据，按 KDP 规则查书名长度、简介 4000 字符上限、
    关键词槽位、正文和封面文件在不在，结果打在日志里。
 2. **复制简介 HTML / 复制 7 个关键词** —— 进剪贴板，手动填表时用。
-3. **用 Chrome 自动填表** —— Selenium 打开 KDP，把书名、副标题、作者、简介、
-   7 个关键词填进新书草稿的第 1 步。**不会替你点发布**，浏览器一直开着；分类、
-   定价、正文 docx 和封面图仍要自己在浏览器里完成。
+3. **用 Chrome 自动填表** —— Selenium 打开 KDP，整条链路都自动：
+
+```text
+书名/副标题/作者/简介/7 个关键词  →  分类（从扒下来的真实分类表里选）
+  →  上传 EPUB 和封面  →  等 KDP 转换完成（官方说要几分钟）
+  →  AI 生成内容申报  →  打开 Kindle 预览器翻几页再返回
+  →  KDP Select / 版税 / 美国站定价  →  可选：点 Publish
+```
 
 第一次会弹出 Chrome 让你手动登录 + 2FA，凭据存在 `~/.kdp_chrome_profile`
 （或你自己指定的 Chrome 用户目录），之后自动复用。
+
+> ⚠️ **两个开关决定它走多远**，都在 `settings.json` / KDP 页签上：
+>
+> | 开关 | 作用 |
+> |---|---|
+> | `kdp_auto_upload` | 改编跑完自动建草稿。草稿可逆，随时能删 |
+> | `kdp_auto_publish` | **自动点 Publish。书进 Amazon 审核队列，撤不回来** |
+>
+> 两个都开 = 无人值守连续发书。第一本务必自己过目确认再放开其余的。
+
+分类不是让模型随口编的：`kdp_categories.json` 是从 KDP 弹层里真实扒下来的
+193 条「一级 > Placement」组合（带 nodeId），模型只能从里面挑，挑不中就丢弃。
+想重扒跑 `python cli.py kdp-categories`。
+
+## 命令行
+
+一本书要跑几小时，界面开着容易被误关，**长任务一律走命令行**。
+
+### 批量队列（推荐）
+
+Drive 文件夹里每个 txt 是一本待改编的书。**不用指定书名**，自动挑没跑过的：
+
+```bash
+python3 cli.py batch --list        # 先看队列：哪些待处理、哪些完成了
+python3 cli.py batch --limit 1     # 跑一本（第一次务必先这样试）
+python3 cli.py batch               # 一直跑到队列空
+python3 cli.py batch --retry-failed # 把失败的打回待处理再跑
+```
+
+### 多终端并行跑不同的书
+
+直接开多个终端，**每个都跑同一条命令**就行：
+
+```bash
+# 终端 1
+cd ~/Desktop/ebook && python3 cli.py batch --limit 1
+# 终端 2
+cd ~/Desktop/ebook && python3 cli.py batch --limit 1
+# 终端 3
+cd ~/Desktop/ebook && python3 cli.py batch --limit 1
+```
+
+它们会**自动分到不同的书**，靠 `_claims/` 里的锁文件（`O_CREAT|O_EXCL`，
+文件系统保证只有一个进程能创建成功）。抢不到的自动跳下一本。
+
+几件已经处理好的事：
+
+- **上架会自动排队** —— Chrome 调试端口写死 9333，多进程会接管同一个浏览器
+  把表单填串。所以上架这一步有跨进程互斥锁，改编照常并行，上架一本一本来。
+- **断了能续** —— 见下面的[断点续跑](#断点续跑)。
+- **别用 `--bg`** —— `running_task.pid` / `.log` 是固定文件名，多开会互相覆盖。
+  要脱离终端用 `tmux`：
+
+```bash
+tmux new -s book1 'cd ~/Desktop/ebook && python3 cli.py batch --limit 1'
+```
+
+> **并发数是账号级的，不是进程级的。** 界面上的「章节并发数」是**每个进程**的值，
+> 三个终端各填 12 = 实际 36 路打同一个账号，很可能撞限流。撞了反而更慢
+> （重试要退避 30 秒、90 秒）。跑 `python3 test_concurrency.py` 实测最优值。
+
+### 指定某一本
+
+```bash
+python3 cli.py adapt --source /path/赤心巡天.txt
+python3 cli.py adapt --from 351 --to 400     # 只补这几章，不导出交付文件
+python3 cli.py adapt --progress              # 只看进度，不调模型
+```
+
+### 其它
+
+```bash
+python3 cli.py status            # 后台任务状态
+python3 cli.py kdp-check         # 检查上架物料齐不齐
+python3 cli.py kdp-categories    # 重扒 KDP 分类表
+python3 test_gdrive.py --folder-name 小说同步   # 测 Drive 连通性
+python3 test_concurrency.py                     # 测最优并发数
+```
+
+## 断点续跑
+
+终端断了、Ctrl-C、甚至 `kill -9`，**直接重跑同一条命令就行**，会自己找回那本书
+从缺口接着跑。五层缓存各管一段：
+
+| 层 | 靠什么 | 断了会怎样 |
+|---|---|---|
+| 队列 | `batch_state.json` | 已完成的跳过，进行中的重新挑中 |
+| 认领锁 | `_claims/*.lock` + PID 判活 | 死锁自动回收，不会永久占住 |
+| 目录归属 | 书名一定下来就回写状态 | 硬杀也不丢，不会另起炉灶重跑 |
+| 全书摘要 | `_summaries/*.md` | 已摘要的块复用 |
+| 章节 | `_chapters/NNNN.json` | 已改编的章跳过 |
+
+## 大模型怎么配
+
+支持两种接入，在界面「大模型」区或 `settings.json` 里配：
+
+| 方式 | 说明 |
+|---|---|
+| `cli` | 调本机已登录的 CLI，走**订阅额度**，不额外花钱 |
+| `api` | OpenAI 兼容接口，按 token 计费 |
+
+CLI 模式有两级降级（主 → 备用），各自配命令、模型和**参数格式**：
+
+```
+agy / claude / gemini :  --model {model} -p {prompt}
+codex                 :  exec --skip-git-repo-check --ephemeral --sandbox read-only -o {outfile} --model {model} {prompt}
+```
+
+参数格式必须可配，因为各家 CLI 对同一个参数的含义能完全相反 ——
+**codex 的 `-p` 是 `--profile` 不是 `--print`**，直接套用会把提示词当成配置档名。
+
+占位符：
+
+- `{model}` `{prompt}` —— 各自作为一个完整参数替换，提示词里的空格换行引号不会拆散命令
+- `{outfile}` —— 给 stdout 混着日志的 CLI 用。codex 会往 stdout 打版本号、workdir、
+  token 用量，直接当正文存每章都是脏的；用 `-o {outfile}` 让它只写最终回答
+
+模型留空就用该 CLI 自己的默认模型（含 `{model}` 的那项连同前面的开关会一起去掉）。
 
 ## 各部分在哪
 
@@ -81,7 +223,10 @@ API Key，点**开始改编**。产出落在 `输出目录/书名/` 下：
 | `video.py` | 背景视频规范化、混音、成片的 ffmpeg 命令 |
 | `pipeline.py` | 视频四步流程编排 |
 | `uploader.py` | YouTube 上传（需要凭证才启用） |
-| `novel_adapter.py` | 章节切分、改编档案、逐章改编、出版元数据、交付打包 |
+| `novel_adapter.py` | 章节切分、全书摘要、改编档案、并行改编、出版元数据、交付打包 |
+| `gdrive.py` | Google Drive 只读访问（服务账号），递归扫子文件夹 |
+| `batch.py` | 批量队列：状态、原子认领、一本一本跑 |
+| `kdp_categories.py` | KDP 分类表的加载与路径匹配 |
 | `kdp_formatter.py` | docx 排版与封面图生成 |
 | `kdp_uploader.py` | KDP 元数据解析、上架预检、Selenium 自动填表 |
 

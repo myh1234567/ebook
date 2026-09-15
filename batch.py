@@ -18,6 +18,7 @@ import os
 import re
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -52,17 +53,45 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+@contextmanager
+def _state_lock():
+    """给 batch_state.json 的读-改-写上互斥锁。
+
+    不加锁的后果实测过：三个进程并发时，A 把某本标成「已完成」，B 拿着更早读到的
+    状态写回去，直接把 A 的结果覆盖掉 —— 那本书会被当成没做过再跑一遍，
+    并且在 Amazon 上建出重复的书。
+    """
+    import fcntl
+    lf = STATE_FILE.with_suffix(".lock")
+    with open(lf, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def load_state() -> Dict[str, dict]:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text("utf-8"))
         except Exception:
-            pass
+            # 读到半截文件（别的进程正在写）不能当成「没有状态」——
+            # 那会让已完成的书被重新跑。宁可抛错也别静默返回空。
+            time.sleep(0.2)
+            try:
+                return json.loads(STATE_FILE.read_text("utf-8"))
+            except Exception:
+                return {}
     return {}
 
 
 def save_state(state: Dict[str, dict]):
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), "utf-8")
+    # 先写临时文件再 rename：rename 是原子的，读的人要么看到旧的完整内容、
+    # 要么看到新的完整内容，不会读到半截
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), "utf-8")
+    os.replace(tmp, STATE_FILE)
 
 
 def list_jobs(folder: str, sa_path: str = "", svc=None) -> List[Job]:
@@ -121,15 +150,36 @@ def claim(job: Job) -> bool:
         os.close(fd)
         return True
     except FileExistsError:
+        pass
+
+    # 锁已存在。要判断持有者是死是活 —— 但这里有个坑（实测踩过）：
+    # 上面 os.open 和 os.write 是两步，中间有个窗口，文件已存在但还是空的。
+    # 这时读到空内容就判「死锁」抢过来的话，两个进程会同时处理同一本书。
+    # 所以读不出 PID 时先重试几次，仍读不出且文件够旧才认定是死锁。
+    pid = -1
+    for _ in range(10):
         try:
-            pid = int(f.read_text().splitlines()[0])
+            head = f.read_text().splitlines()
+            if head and head[0].strip():
+                pid = int(head[0])
+                break
         except Exception:
-            pid = -1
-        if pid > 0 and _alive(pid):
-            return False          # 真的有进程在跑
-        # 锁是死的（进程已退出），抢过来
-        f.unlink(missing_ok=True)
-        return claim(job)
+            pass
+        time.sleep(0.05)
+
+    if pid > 0:
+        if _alive(pid):
+            return False              # 真的有进程在跑
+    else:
+        # 一直读不出 PID：文件够新就当成「别人正在写」，让给它
+        try:
+            if time.time() - f.stat().st_mtime < 60:
+                return False
+        except FileNotFoundError:
+            return claim(job)         # 刚好被别人清掉了，重来
+
+    f.unlink(missing_ok=True)         # 确认是死锁，抢过来
+    return claim(job)
 
 
 def release(job: Job):
@@ -137,12 +187,20 @@ def release(job: Job):
 
 
 def _mark(job: Job, status: str, **kw):
-    state = load_state()
-    rec = state.get(job.file_id, {})
-    rec.update(name=job.name, status=status, updated_at=_now(), **kw)
-    state[job.file_id] = rec
-    save_state(state)
+    # 整个读-改-写必须在锁里，否则并发下会丢更新
+    with _state_lock():
+        state = load_state()
+        rec = state.get(job.file_id, {})
+        rec.update(name=job.name, status=status, updated_at=_now(), **kw)
+        state[job.file_id] = rec
+        save_state(state)
     job.status = status
+
+
+def status_of(file_id: str) -> str:
+    """读某一本的最新状态。并发下必须现读，不能用开头那份快照。"""
+    with _state_lock():
+        return load_state().get(file_id, {}).get("status", "")
 
 
 def _resolve_folder(svc, folder: str) -> str:
@@ -202,10 +260,26 @@ def run_batch(folder: str,
             log("已取消，剩下的保持待处理。")
             break
 
-        # 原子认领：别的终端已经在跑这本就跳过，去拿下一本。
-        # 这样多个终端各跑 `batch --limit 1` 会自动分到不同的书，不用手工指定。
+        # todo 是开头算好的快照。多终端时，别的进程可能在这期间已经把这本做完了 ——
+        # 锁只防「同时处理」，不防「做完之后又被processed一遍」。不重新读状态的话，
+        # 一本书会被跑两次，而且会在 Amazon 上建出重复的书。
+        if status_of(job.file_id) == DONE:
+            log(f"  · 「{job.name}」已被别的进程完成，跳过")
+            tally["skip"] += 1
+            continue
+
+        # 原子认领：别的终端正在跑这本就跳过，去拿下一本。
+        # 这样多个终端各跑 `batch` 会自动分到不同的书，不用手工指定。
         if not claim(job):
-            log(f"  · 「{job.name}」已被别的进程认领，跳过")
+            log(f"  · 「{job.name}」正被别的进程处理，跳过")
+            tally["skip"] += 1
+            continue
+
+        # 拿到锁之后再确认一次：上面那次读状态和拿到锁之间仍有空隙，
+        # 别的进程可能正好在这个空隙里完成并释放了锁。
+        if status_of(job.file_id) == DONE:
+            log(f"  · 「{job.name}」已被别的进程完成，跳过")
+            release(job)
             tally["skip"] += 1
             continue
 
@@ -227,6 +301,9 @@ def run_batch(folder: str,
             # 书名留空让引擎从改编档案里取。但重试一本失败的书时要沿用上次的书名，
             # 否则 project_dir_for 会指到占位目录，已经改编好的章节全白跑。
             cfg.book_title = Path(job.project_dir).name if job.project_dir else ""
+            # 占位目录按 Drive fileId 区分。不给的话所有新书共用
+            # output/Novel_Adaptation_Project，多终端并行会把不同书的章节写到一起。
+            cfg.work_id = job.file_id
 
             engine = novel_adapter.NovelAdaptationEngine(cfg, log_func=log)
 
@@ -244,7 +321,10 @@ def run_batch(folder: str,
                     engine.analyze_source_settings()
                     log(f"    题材={cfg.genre} / {cfg.target_country} {cfg.target_era}")
 
-            proj_dir = engine.run_full_pipeline()
+            # 书名一确定就把项目目录记进状态。硬杀（Ctrl-C/关终端）时
+            # 下面的 except 不会执行，只有这里回写过才能在重启后找回已改编的章节。
+            proj_dir = engine.run_full_pipeline(
+                project_cb=lambda d: _mark(job, RUNNING, project_dir=str(d)))
             mins = (time.time() - t0) / 60
             log(f"✅ 改编完成，耗时 {mins:.0f} 分钟 -> {proj_dir}")
 

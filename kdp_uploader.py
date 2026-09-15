@@ -10,6 +10,7 @@ import re
 import time
 from pathlib import Path
 from typing import Dict, Optional, Callable, List
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import kdp_categories
@@ -128,6 +129,60 @@ AI_AMOUNTS = {
     "images": "FEW_AND_MINIMAL",
     "translations": "PARTIAL_AND_MINIMAL",
 }
+
+
+KDP_LOCK = Path(__file__).resolve().parent / "kdp_upload.lock"
+
+
+def _pid_alive(pid: int) -> bool:
+    import os
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+@contextmanager
+def kdp_upload_lock(log=print, timeout: int = 4 * 3600):
+    """KDP 上架的跨进程互斥锁。
+
+    为什么必须串行：Chrome 调试端口写死成 9333，多个进程会**接管同一个浏览器**，
+    在同一个标签页上填不同的书 —— 字段会串（A 书的简介配 B 书的封面），
+    而且开了自动发布的话，串了的内容会被直接发到 Amazon，撤不回来。
+
+    改编阶段不受影响：那一步各写各的目录，照常并行。只有上架这一步是共享资源。
+
+    拿不到锁就等（不是跳过）：书已经改编好了，该轮到它就得传上去。
+    锁文件里记 PID，进程崩了留下死锁，靠判活回收，否则后面的书永远排不上。
+    """
+    import os
+    waited = 0
+    while True:
+        try:
+            fd = os.open(str(KDP_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()}\n{time.strftime('%F %T')}".encode())
+            os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                holder = int(KDP_LOCK.read_text().splitlines()[0])
+            except Exception:
+                holder = -1
+            if holder > 0 and not _pid_alive(holder):
+                log(f"  · 发现死锁（进程 {holder} 已退出），回收")
+                KDP_LOCK.unlink(missing_ok=True)
+                continue
+            if waited == 0:
+                log(f"  · 另一个进程正在上架（PID {holder}），排队等它…")
+            if waited >= timeout:
+                raise RuntimeError(f"等 KDP 上架锁超过 {timeout // 60} 分钟，放弃")
+            time.sleep(20)
+            waited += 20
+    try:
+        yield
+    finally:
+        KDP_LOCK.unlink(missing_ok=True)
 
 
 class KDPPreflightChecker:
@@ -980,6 +1035,12 @@ class KDPBrowserUploader:
 
         不碰「AI 生成内容」申报，也不点发布——那两件事必须你自己来。
         """
+        # 整个上架流程都在锁里：多进程会接管同一个 Chrome（端口写死 9333），
+        # 不串行的话字段会互相覆盖，开了自动发布还会把串了的内容直接发出去。
+        with kdp_upload_lock(self.log):
+            self._upload_ebook_locked(meta, cancel_event, do_publish)
+
+    def _upload_ebook_locked(self, meta: KDPMetadata, cancel_event, do_publish: bool):
         if not self.driver:
             self.start_browser()
         if not self._goto_new_book(cancel_event):

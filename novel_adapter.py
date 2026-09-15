@@ -71,6 +71,10 @@ class NovelProjectConfig:
     fallback_cli_args: str = "--model {model} -p {prompt}"
     use_mock: bool = False  # 若未填 API 密钥，可使用离线模板模式生成完整项目包
     chapter_workers: int = DEFAULT_WORKERS
+    # 书名定下来之前的占位目录标识。留空的话所有新书共用同一个占位目录，
+    # 多进程并行跑不同的书时会把章节和档案混在一起 —— 批量模式必须传个唯一值
+    # （用 Drive 的 fileId）。
+    work_id: str = ""
 
 
 def config_from_settings(s) -> NovelProjectConfig:
@@ -106,7 +110,10 @@ def config_from_settings(s) -> NovelProjectConfig:
 def project_dir_for(cfg: NovelProjectConfig) -> Path:
     """项目目录 = 输出目录/书名。书名没定时先用占位名，等档案出来再改名。"""
     root = Path(cfg.output_dir) if cfg.output_dir else Path.cwd() / "output"
-    name = re.sub(r'[\s/\\:*?"<>|]', '_', cfg.book_title or "Novel_Adaptation_Project")
+    # 书名没定时用占位名。work_id 非空就按它区分 —— 否则多进程并行跑不同的书，
+    # 会全都写进同一个 Novel_Adaptation_Project 目录，章节互相污染。
+    fallback = f"_wip_{cfg.work_id}" if getattr(cfg, "work_id", "") else "Novel_Adaptation_Project"
+    name = re.sub(r'[\s/\\:*?"<>|]', '_', cfg.book_title or fallback)
     return root / name
 
 
@@ -966,26 +973,87 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
         self.log(f"  分类：{'; '.join(metadata['categories'])}")
         return metadata
 
+    def _work_key(self) -> str:
+        """这本书的唯一标识，用来判断某个项目目录是不是属于它。
+
+        批量模式有 Drive 的 fileId；单本模式退回源文件名。
+        """
+        wid = getattr(self.config, "work_id", "")
+        if wid:
+            return f"drive:{wid}"
+        src = self.config.source_file
+        return f"file:{Path(src).name}" if src else ""
+
     def _settle_project_dir(self, proj_dir: Path, bible_path: Path) -> Path:
-        """书名定下来之后，把占位目录改名成书名目录（已存在同名目录就直接用它）。"""
+        """书名定下来之后，把占位目录改名成书名目录（已存在同名目录就合并进去）。
+
+        不能只靠 `if target.exists()` 判断再 rename：多进程并行时，判断和改名之间
+        另一个进程可能刚好把目标目录建出来，rename 会以 ENOTEMPTY 失败，整本书白跑。
+        所以 rename 必须包在 try 里，失败了退回合并，而不是让异常冒出去。
+        """
         target = project_dir_for(self.config)
         if target == proj_dir:
             return proj_dir
-        if target.exists():
-            if not (target / bible_path.name).exists():
-                (target / bible_path.name).write_text(bible_path.read_text("utf-8"), "utf-8")
-            self.log(f"发现已有同名项目目录，继续用它：{target}（占位目录 {proj_dir.name} 留着没删）")
-        else:
-            proj_dir.rename(target)
-            self.log(f"项目目录已改名为：{target.name}")
+
+        # 归属标记：记这个目录属于哪本源书。书名提取失败时会统一落到
+        # "Untitled Adaptation"，不加区分的话两本不同的书会共用一个目录、章节混在一起。
+        owner = self._work_key()
+        if owner:
+            base, n = target, 1
+            while target.exists() and (target / ".owner").exists() \
+                    and (target / ".owner").read_text("utf-8").strip() != owner:
+                n += 1
+                target = base.with_name(f"{base.name}_{n}")
+            if n > 1:
+                self.log(f"「{base.name}」已被另一本书占用，本书改用 {target.name}")
+
+        if not target.exists():
+            try:
+                proj_dir.rename(target)
+                self.log(f"项目目录已改名为：{target.name}")
+                self._stamp_owner(target)
+                return target
+            except OSError as exc:
+                # 目标被别的进程抢先建好了，走下面的合并
+                self.log(f"改名失败（{exc.strerror}），改为合并到已有目录")
+
+        # 合并：把占位目录里的东西搬进目标目录，目标已有的不覆盖
+        target.mkdir(parents=True, exist_ok=True)
+        moved = 0
+        for item in list(proj_dir.iterdir()) if proj_dir.exists() else []:
+            dest = target / item.name
+            if dest.exists():
+                continue
+            try:
+                item.rename(dest)
+                moved += 1
+            except OSError:
+                pass
+        if not (target / bible_path.name).exists() and bible_path.exists():
+            (target / bible_path.name).write_text(bible_path.read_text("utf-8"), "utf-8")
+        try:
+            proj_dir.rmdir()          # 空了就删掉，不空说明有同名文件，留着
+        except OSError:
+            pass
+        self.log(f"已并入项目目录：{target}（搬了 {moved} 项）")
+        self._stamp_owner(target)
         return target
+
+    def _stamp_owner(self, d: Path):
+        key = self._work_key()
+        if key:
+            try:
+                (d / ".owner").write_text(key, "utf-8")
+            except OSError:
+                pass
 
     def run_full_pipeline(
         self,
         cancel_event=None,
         progress_cb: Optional[Callable[[float], None]] = None,
         stage_cb: Optional[Callable[[str], None]] = None,
-        chapter_range: Optional[tuple] = None
+        chapter_range: Optional[tuple] = None,
+        project_cb: Optional[Callable[[Path], None]] = None
     ) -> Path:
         """执行端到端小说改编与 KDP 交付物打包流程。
 
@@ -1045,6 +1113,14 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
                 self.log("没能从档案里认出推荐书名，先用 Untitled Adaptation，"
                          "建议在界面「英文书名」里手填一个。")
             proj_dir = self._settle_project_dir(proj_dir, bible_path)
+            # 书名一定下来立刻通知调用方。批量模式靠这个把项目目录记进队列状态：
+            # Ctrl-C / 关终端属于硬杀，except 分支根本不会执行，不在这里回写的话
+            # 重启后书名丢了，找不到已改编的章节，几小时的活要从头再来。
+            if project_cb:
+                try:
+                    project_cb(proj_dir)
+                except Exception:
+                    pass
 
         # 3. 逐章改编。每章改完立刻落盘，断在哪儿下次就从哪儿接着跑
         ch_dir = proj_dir / "_chapters"
