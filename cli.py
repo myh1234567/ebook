@@ -159,6 +159,9 @@ def load_cfg(args):
                       f"忽略设置里的书名「{cfg.book_title}」，改用自动识别）")
             cfg.book_title = ""
             cfg.subtitle = ""
+    # --title 放在清空之后：显式指定的书名优先级最高，不该被上面那段抹掉
+    if getattr(args, "title", ""):
+        cfg.book_title = args.title.strip()
     # 占位目录按源文件区分。不给的话每次重跑都用同一个
     # output/Novel_Adaptation_Project，而上次跑完它已经改名成书名目录了 ——
     # 于是这次找不到进度，重新生成改编档案、模型给出不同的书名、再建一个新目录，
@@ -176,7 +179,18 @@ def run_kdp_autopost(settings, proj_dir) -> str:
     发布与否看 kdp_auto_publish：点了 Publish 就撤不回来了，所以默认只到草稿。
     """
     try:
-        meta = kdp_uploader.KDPMetadata.load_from_project_dir(Path(proj_dir))
+        proj_dir = Path(proj_dir)
+        # 分卷后根目录不再有 07_Manuscript.epub，正文都在 VolN_* 里。
+        # 不先报这一句的话，预检只会甩一句「未找到正文文件」，看不出是找错了目录。
+        vols = sorted(d for d in proj_dir.glob("Vol*")
+                      if d.is_dir() and (d / "03_Publishing_Copy.txt").exists())
+        if vols and not (proj_dir / "07_Manuscript.epub").exists():
+            return (f"⚠️ *没有上架*：这个项目切成了 {len(vols)} 卷，正文在 "
+                    f"{'、'.join(d.name for d in vols[:3])}… 各自的目录里，"
+                    f"而上架只会读项目根目录 `{proj_dir.name}`，那里已经没有正文文件了。"
+                    f"逐卷上架还没接。")
+
+        meta = kdp_uploader.KDPMetadata.load_from_project_dir(proj_dir)
         meta.price = settings.kdp_price
         meta.royalty = settings.kdp_royalty
         issues = [i for i in kdp_uploader.KDPPreflightChecker.check(meta)
@@ -461,6 +475,9 @@ def main():
     # 2. 小说跨文化改编
     p_adapt = subparsers.add_parser("adapt", help="执行小说跨文化改编与 KDP 母稿生成")
     p_adapt.add_argument("--source", type=str, help="中文原著 txt 路径")
+    p_adapt.add_argument("--title", type=str, default="",
+                         help="英文书名。不给就从改编档案里取推荐书名；"
+                              "档案解析不出来时会落到占位名，这时用它手动指定")
     p_adapt.add_argument("--from", dest="first", type=int, default=0, help="只改编这一章起（含）")
     p_adapt.add_argument("--to", dest="last", type=int, default=0, help="只改编到这一章为止（含）")
     p_adapt.add_argument("--progress", action="store_true", help="只看进度，不调用模型")

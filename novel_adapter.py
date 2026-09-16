@@ -63,6 +63,17 @@ COVER_TIMEOUT = 240
 # 第一本免费引流、后续付费，所以切点必须落在剧情的自然段落上，不能按字数平均分。
 VOL_MIN, VOL_MAX = 3, 8     # 封面是锦上添花，画不出来就用纯排版，不值得占用 30 分钟
 
+# 书名还没定下来时的占位名。这些永远不能当真书名用：
+# 一旦当真，目录名会被回读成书名，下次重跑就不再去档案里取，坏书名就焊死了，
+# 而且会印到分卷标题（「Untitled Adaptation: Book 1」）和封面上。
+PLACEHOLDER_TITLE = "Untitled Adaptation"
+
+
+def is_placeholder_title(name: str) -> bool:
+    """判断一个名字是不是占位名（目录名的下划线形态也算）。"""
+    n = (name or "").replace("_", " ").strip().lower()
+    return (not n) or n == PLACEHOLDER_TITLE.lower() or n.startswith("wip ")
+
 
 @dataclass
 class NovelProjectConfig:
@@ -1436,9 +1447,10 @@ Return JSON, nothing else:
         proj_dir = self._find_own_project()
         if proj_dir:
             # 目录名只有在它已经是真书名时才能当书名用。
-            # _wip_xxx 是书名还没定下来时的占位名，拿它当书名的话：
-            # 目录永远不会改名、分卷会叫「_wip_xxx: Book 1」、封面上也印这串。
-            if not self.config.book_title and not proj_dir.name.startswith("_wip_"):
+            # _wip_xxx / Untitled_Adaptation 都是书名还没定下来时的占位名，
+            # 拿它当书名的话：目录永远不会改名、分卷会叫「Untitled Adaptation: Book 1」、
+            # 封面上也印这串，而且下次重跑不会再去档案里取，坏书名就永久焊死了。
+            if not self.config.book_title and not is_placeholder_title(proj_dir.name):
                 self.config.book_title = proj_dir.name.replace("_", " ")
             self.log(f"找到这本书已有的项目目录，继续用它：{proj_dir.name}")
         else:
@@ -1491,14 +1503,18 @@ Return JSON, nothing else:
             return proj_dir
 
         # 提取或确认最终书名，并把项目目录改成书名——续跑要靠目录名对得上
-        if not self.config.book_title:
+        # 占位名也要当成「还没定书名」重试一次：上一轮解析失败留下的
+        # Untitled Adaptation 不能就这么一直带下去。
+        if is_placeholder_title(self.config.book_title):
             self.config.book_title = self.extract_title(bible_md)
             if self.config.book_title:
                 self.log(f"采用档案推荐的书名：{self.config.book_title}")
             else:
-                self.config.book_title = "Untitled Adaptation"
-                self.log("没能从档案里认出推荐书名，先用 Untitled Adaptation，"
-                         "建议在界面「英文书名」里手填一个。")
+                self.config.book_title = PLACEHOLDER_TITLE
+                self.log(f"⚠️ 没能从 08_Adaptation_Bible.md 里认出推荐书名，"
+                         f"暂用「{PLACEHOLDER_TITLE}」。这个名字会印进分卷标题和封面，"
+                         f"别就这么发出去 —— 用 --title \"你的书名\" 指定，"
+                         f"或在界面「英文书名」里手填。")
             proj_dir = self._settle_project_dir(proj_dir, bible_path)
             # 书名一定下来立刻通知调用方。批量模式靠这个把项目目录记进队列状态：
             # Ctrl-C / 关终端属于硬杀，except 分支根本不会执行，不在这里回写的话
