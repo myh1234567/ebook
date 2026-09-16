@@ -17,6 +17,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -173,39 +174,83 @@ def load_cfg(args):
     return cfg
 
 
+# 传过的书在自己目录里留个标记。adapt 每跑完一次结尾都会调上架，
+# 不记的话重跑一次就在 KDP 上多出一整套重复草稿，只能上网页一本本删。
+KDP_UPLOADED_MARK = ".kdp_uploaded"
+
+
+def _book_dirs(proj_dir: Path):
+    """这个项目要上架几本书。分卷了就是各卷目录，没分卷就是项目本身。
+
+    按卷号数字排序，不能用字典序 —— Vol10 会排到 Vol2 前面去。
+    """
+    vols = []
+    for d in proj_dir.glob("Vol*"):
+        if not d.is_dir() or not (d / "03_Publishing_Copy.txt").exists():
+            continue
+        m = re.match(r"Vol(\d+)", d.name)
+        vols.append((int(m.group(1)) if m else 0, d))
+    return [d for _, d in sorted(vols, key=lambda t: t[0])] or [proj_dir]
+
+
+def _kdp_post_one(settings, book_dir: Path, upload_one, do_pub: bool):
+    """上架一本。返回 (成不成, 给 Telegram 的一行)。"""
+    meta = kdp_uploader.KDPMetadata.load_from_project_dir(book_dir)
+    meta.price = settings.kdp_price
+    meta.royalty = settings.kdp_royalty
+    bad = [i for i in kdp_uploader.KDPPreflightChecker.check(meta)
+           if i.startswith("【严重】")]
+    if bad:
+        return False, f"⚠️ {book_dir.name}：预检没过 —— " + "；".join(bad)
+    upload_one(meta, None, do_pub)
+    (book_dir / KDP_UPLOADED_MARK).write_text(
+        f"{meta.title}\n{time.strftime('%F %T')}\n", encoding="utf-8")
+    return True, f"✅ {book_dir.name}：{meta.title}"
+
+
 def run_kdp_autopost(settings, proj_dir) -> str:
-    """改编跑完直接建 KDP 草稿。返回一段给 Telegram 用的结果文字。
+    """改编跑完直接建 KDP 草稿。分卷了就一卷一本，逐本上架。
 
     发布与否看 kdp_auto_publish：点了 Publish 就撤不回来了，所以默认只到草稿。
     """
     try:
         proj_dir = Path(proj_dir)
-        # 分卷后根目录不再有 07_Manuscript.epub，正文都在 VolN_* 里。
-        # 不先报这一句的话，预检只会甩一句「未找到正文文件」，看不出是找错了目录。
-        vols = sorted(d for d in proj_dir.glob("Vol*")
-                      if d.is_dir() and (d / "03_Publishing_Copy.txt").exists())
-        if vols and not (proj_dir / "07_Manuscript.epub").exists():
-            return (f"⚠️ *没有上架*：这个项目切成了 {len(vols)} 卷，正文在 "
-                    f"{'、'.join(d.name for d in vols[:3])}… 各自的目录里，"
-                    f"而上架只会读项目根目录 `{proj_dir.name}`，那里已经没有正文文件了。"
-                    f"逐卷上架还没接。")
-
-        meta = kdp_uploader.KDPMetadata.load_from_project_dir(proj_dir)
-        meta.price = settings.kdp_price
-        meta.royalty = settings.kdp_royalty
-        issues = [i for i in kdp_uploader.KDPPreflightChecker.check(meta)
-                  if i.startswith("【严重】")]
-        if issues:
-            return "⚠️ *预检没过，没有上架*：\n" + "\n".join(issues)
+        books = _book_dirs(proj_dir)
+        todo = [b for b in books if not (b / KDP_UPLOADED_MARK).exists()]
+        done = len(books) - len(todo)
+        if not todo:
+            return (f"📚 这 {len(books)} 本之前都传过了，跳过。"
+                    f"要重传就删掉各自目录里的 `{KDP_UPLOADED_MARK}`")
 
         do_pub = bool(getattr(settings, "kdp_auto_publish", False))
-        print(f"\n📤 开始自动上架（自动发布={do_pub}）...")
+        print(f"\n📤 开始自动上架：{len(todo)} 本"
+              + (f"（另有 {done} 本传过了，跳过）" if done else "")
+              + f"，自动发布={do_pub}")
         up = kdp_uploader.KDPBrowserUploader(
             user_data_dir=settings.kdp_chrome_profile or None, log_func=print)
-        up.upload_ebook(meta, do_publish=do_pub)
-        return ("🚀 *已自动提交发布*，等 Amazon 审核（约 72 小时）"
+
+        lines, ok = [], 0
+        # 整套书一把锁：锁放开的空当别的终端会接管同一个 Chrome 去传它的书，
+        # 一套系列就被切散了。代价是别人要排队等这一整套传完。
+        with up.upload_session() as upload_one:
+            for i, b in enumerate(todo, 1):
+                if len(todo) > 1:
+                    print(f"\n—— 第 {i}/{len(todo)} 本：{b.name} ——")
+                try:
+                    good, line = _kdp_post_one(settings, b, upload_one, do_pub)
+                    ok += good
+                    lines.append(line)
+                except Exception as exc:
+                    # 一本挂了不能拖垮剩下的：成功的已打标记，重跑只补没传的
+                    print(f"   ❌ 这本失败了，继续下一本：{exc}")
+                    lines.append(f"❌ {b.name}：{exc}")
+
+        head = (f"🚀 *{ok}/{len(todo)} 本已提交发布*，等 Amazon 审核（约 72 小时）"
                 if do_pub else
-                "📝 *KDP 草稿已建好*，正文封面定价都填完了，就差你点 Publish")
+                f"📝 *{ok}/{len(todo)} 本草稿已建好*，正文封面定价都填完了，就差你点 Publish")
+        if ok < len(todo):
+            head += "（有失败的，重跑会只补没传的那几本）"
+        return head + "\n" + "\n".join(lines)
     except Exception as exc:
         return f"⚠️ *自动上架失败*：{exc}"
 

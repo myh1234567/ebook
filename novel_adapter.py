@@ -69,6 +69,11 @@ VOL_MIN, VOL_MAX = 3, 8     # 封面是锦上添花，画不出来就用纯排�
 PLACEHOLDER_TITLE = "Untitled Adaptation"
 
 
+# 书名可能被加粗、斜体或引号包着，模型每次挑的不一样，所以几种都要认
+_EMPH_RE = re.compile(
+    r'\*\*(.+?)\*\*|\*(.+?)\*|__(.+?)__|_(.+?)_|“(.+?)”|"(.+?)"|《(.+?)》')
+
+
 def is_placeholder_title(name: str) -> bool:
     """判断一个名字是不是占位名（目录名的下划线形态也算）。"""
     n = (name or "").replace("_", " ").strip().lower()
@@ -836,17 +841,58 @@ Ensure all names and institutions fit the target era authentic to {self.config.t
 
     @staticmethod
     def extract_title(bible_md: str) -> str:
-        """从改编档案里挑出推荐书名。模型有时给表格有时给列表，两种都得认。"""
+        """从改编档案里挑出推荐书名。
+
+        模型给的形态很杂，实测见过这几种：
+            **Recommended title:** *书名*     加粗的是标签，书名在后面用斜体
+            ### 1. *书名* — Recommended       书名斜体，Recommended 是普通词
+            **书名** — Recommended            书名加粗
+            Option 1 (Recommended): 书名      纯文本
+
+        原来只认加粗，碰上第一种时唯一的加粗段是「Recommended title:」这个标签，
+        被那条「滤掉含 recommend 的」规则干掉，剩下空列表 —— 整本书就落到占位名，
+        分卷标题和封面上全印着 Untitled Adaptation。
+        """
+        def clean(s: str) -> str:
+            return (s or "").strip(" *_\"“”‘’:：—–-").strip()
+
+        def emphasized(line: str) -> List[str]:
+            out = []
+            for m in _EMPH_RE.finditer(line):
+                v = clean(next((g for g in m.groups() if g), ""))
+                if v and len(v) < 80:
+                    out.append(v)
+            return out
+
+        # 1) 带 recommend 的行：书名是那个「本身不含 recommend」的强调段
         for line in bible_md.splitlines():
-            bolds = [b.strip(" *_\"“”") for b in re.findall(r'\*\*(.+?)\*\*', line)]
-            bolds = [b for b in bolds if b and "recommend" not in b.lower()
-                     and not b.lower().startswith("option") and len(b) < 80]
-            if bolds and "recommend" in line.lower():
-                return bolds[0]
-        # 退一步：老格式 "Option 1 (Recommended): The Title — 理由"
+            if "recommend" not in line.lower():
+                continue
+            cands = [s for s in emphasized(line)
+                     if "recommend" not in s.lower()
+                     and not s.lower().startswith("option")]
+            if cands:
+                return cands[0]
+            # 整行没有强调标记，退回冒号后面那截："Recommended title: 书名"
+            if ":" in line or "：" in line:
+                tail = re.sub(r'[*_#]+', '', re.split(r'[:：]', line, maxsplit=1)[1])
+                # 书名后面常跟一段理由，用空格围起来的破折号/连字符隔开。
+                # 只切「带空格的」分隔符，免得把 Twenty-One 这种带连字符的书名切断。
+                tail = clean(re.split(r'\s+[—–-]\s+', tail, maxsplit=1)[0])
+                if tail and len(tail) < 80 and "recommend" not in tail.lower():
+                    return tail
+
+        # 2) 档案的标题行：# Adaptation Bible: *书名*
+        m = re.search(r'^#+\s*Adaptation Bible\s*[:：]\s*(.+)$', bible_md, re.MULTILINE)
+        if m:
+            t = clean(re.sub(r'[*_]+', '', m.group(1)))
+            if t and len(t) < 80:
+                return t
+
+        # 3) 老格式 "Option 1 (Recommended): The Title — 理由"
         m = re.search(r'Option 1.*?:\s*\**(.+?)\**\s*(?:—|-|\(|$)', bible_md, re.MULTILINE)
         if m and m.group(1).strip():
-            return m.group(1).strip(" *_\"“”")
+            return clean(m.group(1))
         return ""
 
     def adapt_chapter(self, index: int, raw_title: str, raw_content: str, bible_text: str) -> Dict[str, str]:

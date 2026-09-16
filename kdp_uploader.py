@@ -1040,6 +1040,20 @@ class KDPBrowserUploader:
         with kdp_upload_lock(self.log):
             self._upload_ebook_locked(meta, cancel_event, do_publish)
 
+    @contextmanager
+    def upload_session(self):
+        """把一整套系列书圈在同一把锁里，交出一个「传一本」的函数。
+
+        为什么不是每本各取一次锁：锁放开的空当，另一个终端会接管同一个 Chrome
+        （端口写死 9333）去传它自己的书，一套系列就被切成几段、中间夹着别人的书。
+        更糟的是两边的 driver 指着同一个浏览器，谁也不知道对方把页面导航到哪了。
+
+        代价是别的终端要等这一整套传完（锁自带 4 小时上限，到点会报错不会死等）。
+        八本大约几十分钟，比起把系列打散、或者两个进程抢同一个浏览器，这个代价值得。
+        """
+        with kdp_upload_lock(self.log):
+            yield self._upload_ebook_locked
+
     def _upload_ebook_locked(self, meta: KDPMetadata, cancel_event, do_publish: bool):
         if not self.driver:
             self.start_browser()
