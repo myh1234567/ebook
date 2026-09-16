@@ -332,9 +332,21 @@ def run_chrome(args):
     对一个已经在跑的 Chrome 事后补上。所以只能关掉重起 —— 走 AppleScript 优雅退出，
     会话会保存，重开后标签页能恢复。
     """
-    profile = args.profile or kdp_uploader.default_chrome_profile()
-    print(f"profile: {profile}")
-    print(f"profile-directory: {args.profile_dir}")
+    pids = kdp_uploader.chrome_pids()
+    udd, pdir = kdp_uploader.running_chrome_profile()
+    alive = kdp_uploader.debug_port_alive(args.port)
+    print(f"Chrome 主进程    : {pids or '没开'}")
+    print(f"它在用的 profile : {udd or '(默认路径)'}"
+          + (f"  子目录 {pdir}" if pdir else ""))
+    print(f"调试端口 {args.port}   : {'开着，可以直接接管' if alive else '没开'}")
+    if args.detect:
+        if not alive and pids:
+            print("\n端口没开 → 上架会另起一个新 Chrome（空 profile，要重新登录）。")
+            print("跑 `cli.py chrome` 把它带端口重起，用的还是上面那个 profile。")
+        return
+
+    profile = args.profile or ""
+    print()
     kdp_uploader.launch_debug_chrome(
         profile=profile, profile_dir=args.profile_dir,
         port=args.port, log=print)
@@ -665,8 +677,10 @@ def main():
     # 8. 把 Chrome 带调试端口重起，好让上架沿用你自己的登录态
     p_chrome = subparsers.add_parser(
         "chrome", help="用你自己的 Chrome profile 带调试端口重起，上架时直接复用登录态")
+    p_chrome.add_argument("--detect", action="store_true",
+                          help="只报告当前 Chrome 用的哪个 profile、端口开没开，不动它")
     p_chrome.add_argument("--profile", type=str, default="",
-                          help="user-data-dir，默认你真实的 Chrome 目录")
+                          help="user-data-dir，默认沿用当前 Chrome 正在用的那个")
     p_chrome.add_argument("--profile-dir", dest="profile_dir", type=str, default="Default",
                           help="profile 子目录，多账号时可能是 Profile 1、Profile 2")
     p_chrome.add_argument("--port", type=int, default=kdp_uploader.CHROME_DEBUG_PORT,

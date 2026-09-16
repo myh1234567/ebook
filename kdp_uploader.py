@@ -234,6 +234,32 @@ def default_chrome_profile() -> str:
     return str(Path.home() / "Library/Application Support/Google/Chrome")
 
 
+def running_chrome_profile():
+    """从正在运行的 Chrome 主进程命令行里读出它用的是哪个 profile。
+
+    返回 (user_data_dir, profile_directory)。命令行里没带这两个参数就是用默认的。
+
+    为什么要检测而不是写死默认路径：用户可能开着非默认 profile（多账号、
+    或者像这台机器上那样开着脚本自己起的专用 profile）。写死的话，
+    「带端口重起」会重起成另一个 profile —— 登录态照样不在，白折腾一轮。
+    """
+    pids = chrome_pids()
+    if not pids:
+        return "", ""
+    try:
+        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pids[0])],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return "", ""
+    udd = prof = ""
+    for tok in cmd.split():
+        if tok.startswith("--user-data-dir="):
+            udd = tok.split("=", 1)[1]
+        elif tok.startswith("--profile-directory="):
+            prof = tok.split("=", 1)[1]
+    return udd, prof
+
+
 def chrome_pids() -> List[int]:
     """正在跑的 Chrome 主进程。-x 只匹配进程名，不会把渲染子进程算进来。"""
     try:
@@ -279,7 +305,28 @@ def launch_debug_chrome(profile: str = "", profile_dir: str = "Default",
         log(f"Chrome 已经开着调试端口 {port}，不用动。")
         return True
 
-    profile = profile or default_chrome_profile()
+    # 没显式指定就用「你现在这个 Chrome 正在用的那个 profile」，
+    # 这样重起之后书签、cookie、登录态原样都在。检测不到才退回默认路径。
+    from_detect = False
+    if not profile:
+        detected, detected_dir = running_chrome_profile()
+        profile = detected or default_chrome_profile()
+        if detected:
+            from_detect = True
+            log(f"检测到当前 Chrome 用的 profile：{detected}")
+            if detected_dir and profile_dir == "Default":
+                profile_dir = detected_dir
+        else:
+            log(f"当前 Chrome 没指定 profile，按默认路径走：{profile}")
+
+    # 检测来的 profile 必定已经存在。真不存在就说明检测结果不对劲 ——
+    # 这时候 mkdir 出一个空目录，Chrome 会带着全新空 profile 起来，
+    # 登录态一个没有，而且看起来一切正常，最难查的就是这种。
+    if from_detect and not Path(profile).exists():
+        raise RuntimeError(
+            f"检测到的 profile 路径不存在：{profile}\n"
+            f"    用 --profile 显式指定一个，或者先确认那个 Chrome 还开着。")
+
     if chrome_pids():
         # 同一个 user-data-dir 只允许一个 Chrome 实例持有。不先退出就硬起，
         # Chrome 会退回一个临时空 profile —— 表现是「明明登录过却显示未登录」。
