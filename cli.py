@@ -30,7 +30,9 @@ LOG_FILE = APP_DIR / "running_task.log"
 
 sys.path.insert(0, str(APP_DIR))
 from config import Settings
-import pipeline
+# pipeline 不在这里导：它会拉起助眠视频那条链路（tts -> edge_tts、f5-tts 等），
+# 而小说改编和 KDP 上架完全用不到。顶部无条件导入的话，只想跑 adapt 的机器
+# 也得装一堆 TTS 依赖，缺一个就整个 cli 起不来。用到时再导。
 import novel_adapter
 import kdp_uploader
 import notify
@@ -109,6 +111,7 @@ def run_video(args):
 
     t0 = time.time()
     try:
+        import pipeline          # 只有真要生成视频时才需要 TTS 那套依赖
         out_path = pipeline.generate(s, log=print)
         elapsed = time.time() - t0
         success_msg = f"🎉 *助眠视频生成成功！*\n\n📁 路径: `{out_path}`\n⏱️ 耗时: {elapsed:.1f} 秒"

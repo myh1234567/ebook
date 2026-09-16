@@ -1084,13 +1084,46 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
             vtitle = f"{base}: Book {n}"
             vsub = v["subtitle"]
 
+            # 封面必须先做：epub 内封要用本卷自己那张。之前是先建 epub 再合成封面，
+            # 结果每卷 epub 里压的都是全书那张底图，读者在阅读器里分不出是第几卷。
+            # 每卷画自己的底图：三本书用同一张图的话，读者在商品页上
+            # 分不出哪本是第几卷，系列感也出不来。提示词带上本卷剧情，
+            # 同时锁定统一的美术风格，让几本放在一起像一个系列。
+            vart = vdir / "06_Cover_Art_Raw.png"
+            if not vart.exists():
+                self.generate_cover_art(
+                    f"Book {n} of the series \"{base}\", volume subtitle \"{vsub}\". "
+                    f"This volume covers: {v.get('arc', '')}. "
+                    f"Genre: {self.config.genre}. Setting: {self.config.target_country}, "
+                    f"{self.config.target_era}. Keep the same art direction, palette and "
+                    f"mood across the whole series so the covers read as one set, but make "
+                    f"THIS cover's subject clearly different from the other volumes.",
+                    vart)
+            # 画不出来（额度用完、CLI 没有出图工具）就退回全书那张底图，
+            # 至少各卷压的文字不同，还能分辨
+            bg = vart if vart.exists() else (
+                cover_src if (cover_src and cover_src.exists()) else None)
+            vcover = vdir / "05_Ebook_Cover.png"
+            try:
+                kdp_formatter.create_cover_graphic(
+                    title=base, subtitle=f"Book {n} — {vsub}",
+                    author=self.config.author_name,
+                    tagline=v.get("arc", "")[:80],
+                    output_path=vcover,
+                    background=bg)
+            except Exception as exc:
+                self.log(f"  · 第 {n} 卷封面合成失败（{exc}）")
+
+            # 合成失败就退到本卷底图，再退到全书封面，最后才是没有内封
+            epub_cover = next(
+                (p for p in (vcover, vart, cover_src) if p and p.exists()), None)
             kdp_formatter.format_manuscript_docx(
                 title=vtitle, subtitle=vsub, author=self.config.author_name,
                 chapters=part, output_path=vdir / "01_English_Manuscript.docx")
             kdp_formatter.format_manuscript_epub(
                 title=vtitle, subtitle=vsub, author=self.config.author_name,
                 chapters=part, output_path=vdir / "07_Manuscript.epub",
-                cover_image=cover_src if cover_src and cover_src.exists() else None)
+                cover_image=epub_cover)
 
             meta = self.generate_volume_metadata(v, len(vols), bible_md, part)
             (vdir / "03_Publishing_Copy.txt").write_text(
@@ -1112,33 +1145,6 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
                 + "\n".join(f"Category {i+1}: {c}" for i, c in enumerate(meta["categories"]))
                 + f"\n\n--------------------------------------------------\n"
                 f"本卷覆盖原书第 {s}-{e} 章（共 {len(part)} 章）\n{v.get('arc','')}\n", "utf-8")
-
-            # 每卷画自己的底图：三本书用同一张图的话，读者在商品页上
-            # 分不出哪本是第几卷，系列感也出不来。提示词带上本卷剧情，
-            # 同时锁定统一的美术风格，让几本放在一起像一个系列。
-            vart = vdir / "06_Cover_Art_Raw.png"
-            if not vart.exists():
-                self.generate_cover_art(
-                    f"Book {n} of the series \"{base}\", volume subtitle \"{vsub}\". "
-                    f"This volume covers: {v.get('arc', '')}. "
-                    f"Genre: {self.config.genre}. Setting: {self.config.target_country}, "
-                    f"{self.config.target_era}. Keep the same art direction, palette and "
-                    f"mood across the whole series so the covers read as one set, but make "
-                    f"THIS cover's subject clearly different from the other volumes.",
-                    vart)
-            # 画不出来（额度用完、CLI 没有出图工具）就退回全书那张底图，
-            # 至少各卷压的文字不同，还能分辨
-            bg = vart if vart.exists() else (
-                cover_src if (cover_src and cover_src.exists()) else None)
-            try:
-                kdp_formatter.create_cover_graphic(
-                    title=base, subtitle=f"Book {n} — {vsub}",
-                    author=self.config.author_name,
-                    tagline=v.get("arc", "")[:80],
-                    output_path=vdir / "05_Ebook_Cover.png",
-                    background=bg)
-            except Exception as exc:
-                self.log(f"  · 第 {n} 卷封面合成失败（{exc}）")
 
             made.append(vdir)
             self.log(f"-> {vdir.name}（第 {s}-{e} 章，{len(part)} 章）")
