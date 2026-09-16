@@ -156,6 +156,14 @@ def load_cfg(args):
                       f"忽略设置里的书名「{cfg.book_title}」，改用自动识别）")
             cfg.book_title = ""
             cfg.subtitle = ""
+    # 占位目录按源文件区分。不给的话每次重跑都用同一个
+    # output/Novel_Adaptation_Project，而上次跑完它已经改名成书名目录了 ——
+    # 于是这次找不到进度，重新生成改编档案、模型给出不同的书名、再建一个新目录，
+    # 几百章的活白跑一遍。实测已经因此跑出了两个同书异名的目录。
+    if cfg.source_file:
+        import hashlib
+        cfg.work_id = hashlib.md5(
+            str(Path(cfg.source_file).resolve()).encode()).hexdigest()[:10]
     return cfg
 
 

@@ -32,10 +32,11 @@ TIER_TRIP_AFTER = 2
 # 改编档案要完整送：它装着人物映射表、术语对照表、连续性追踪，
 # 原来只送前 1200 字，恰好只够装书名备选表，真正要紧的三张表一张都没送到。
 MAX_BIBLE_CHARS = 30000
-# 本章原文要完整送：实测某本 799 章的书，中位数 4140 字、96% 的章节超过 3000 字，
-# 按原来的 3000 字截断，全书 45% 的原文根本没进过模型。
-# 留个上限只为拦异常章节（章节切分失效时会出现几十万字的「一章」）。
-MAX_CHAPTER_CHARS = 24000
+# 本章原文一律完整送，不设截断上限。实测某本 799 章的书，中位数 4140 字、
+# 96% 的章节超过 3000 字，按原来的 3000 字截断，全书 45% 的原文没进过模型。
+# 后来改成 24000 上限，又把 3 万字的正常长章节误伤了 —— 截断这个做法本身就不对：
+# 它静默丢内容，成品里看不出少了什么。现在只在异常长的时候打个提醒，不动内容。
+BIG_CHAPTER_WARN = 30000   # 超过这个字数就提醒一句，多半是章节切分失效
 # 全书摘要（map-reduce）：改编档案必须建立在「读过全书」的基础上。
 # 原来只拿前 3 章的 1800 字就去定全书的人物表和术语表，后期人名必然漂。
 # 全文一次送不进去（某本 431 万字，差一个数量级），所以先分块摘要再汇总。
@@ -44,6 +45,23 @@ MAX_SUMMARY_CHARS = 60000     # 汇总后的全书总结送进提示词的上限
 # 章节并行度。每章调用只依赖「全书总结 + 本章原文」，不依赖已改编的章节，
 # 所以并行产出和串行逐字相同，只是快 N 倍。实测单次调用约 16 秒且与推理档位无关。
 DEFAULT_WORKERS = 20
+
+# 画封面底图要让 CLI 写文件，得放开工具权限 —— 而各家的开关完全不同，
+# 不能像原来那样写死 agy/claude 的参数（codex 三个参数一个都不认，
+# 结果是必然失败，还要白等 CLI_TIMEOUT 那 1900 秒才退回纯排版封面）。
+# 键是命令名（取 basename），{model} {prompt} 会被替换。
+COVER_ARGS = {
+    "agy":    "--dangerously-skip-permissions --model {model} --prompt {prompt}",
+    "claude": "--dangerously-skip-permissions --model {model} --prompt {prompt}",
+    "gemini": "--yolo -m {model} -p {prompt}",
+    "codex":  "exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "
+              "--model {model} {prompt}",
+}
+COVER_TIMEOUT = 240
+
+# 分卷：一本长篇中文小说切成若干本英文书当系列发。
+# 第一本免费引流、后续付费，所以切点必须落在剧情的自然段落上，不能按字数平均分。
+VOL_MIN, VOL_MAX = 3, 8     # 封面是锦上添花，画不出来就用纯排版，不值得占用 30 分钟
 
 
 @dataclass
@@ -75,6 +93,7 @@ class NovelProjectConfig:
     # 多进程并行跑不同的书时会把章节和档案混在一起 —— 批量模式必须传个唯一值
     # （用 Drive 的 fileId）。
     work_id: str = ""
+    split_volumes: bool = True
 
 
 def config_from_settings(s) -> NovelProjectConfig:
@@ -104,6 +123,7 @@ def config_from_settings(s) -> NovelProjectConfig:
                                   "--model {model} -p {prompt}"),
         use_mock=s.use_mock_adaptation,
         chapter_workers=int(getattr(s, "chapter_workers", DEFAULT_WORKERS) or DEFAULT_WORKERS),
+        split_volumes=bool(getattr(s, "split_volumes", True)),
     )
 
 
@@ -154,10 +174,43 @@ def build_cli_args(template: str, model: str, prompt: str,
     return out
 
 
+def _pick_error(stderr: str, stdout: str, limit: int = 400) -> str:
+    """从 CLI 的输出里挑出真正的错误行。
+
+    不能直接取前 300 字符：codex 每次都先打一大段横幅（版本号、workdir、model、
+    sandbox、session id），300 字符全被横幅吃掉，真正的错误在后面被截没了。
+    实测就因为这个，把「You've hit your usage limit」当成了别的问题查。
+
+    策略：先挑含错误关键词的行；一条都没有再取**末尾**（错误通常在最后），
+    而不是开头。
+    """
+    text = ((stderr or "") + "\n" + (stdout or "")).strip()
+    if not text:
+        return "（没有输出）"
+    keys = ("error", "错误", "failed", "failure", "limit", "quota",
+            "denied", "unauthorized", "not found", "invalid", "exceed")
+    hits = [ln.strip() for ln in text.splitlines()
+            if ln.strip() and any(k in ln.lower() for k in keys)]
+    if hits:
+        # 同一条错误 codex 会重复打印，去个重
+        seen, uniq = set(), []
+        for h in hits:
+            if h not in seen:
+                seen.add(h)
+                uniq.append(h)
+        return " | ".join(uniq)[:limit]
+    return "…" + text[-limit:]
+
+
 class ChapterSplitter:
     """自动将中文小说源文件切分为结构化章节。"""
+    # 中文数字必须把 零 两 万 亿 都算上。原来只有「一二三四五六七八九十百千」，
+    # 结果「第九百零一章」「第两千四百三十二章」这类标题匹配不上，被当成正文
+    # 并进上一章 —— 实测某本 2245 章的书因此出现 72,251 字的「一章」，
+    # 十几章被吞掉、章号整体错位。
     CHAPTER_REGEX = re.compile(
-        r'^\s*(第[0-9一二三四五六七八九十百千]+[章回卷节篇]|Chapter\s+\d+|[Cc]hapter\s+[IVXLCDM]+|[0-9]{1,4}\s*[\.、])\s*(.*)$',
+        r'^\s*(第[0-9零一两二三四五六七八九十百千万亿]+[章回卷节篇]'
+        r'|Chapter\s+\d+|[Cc]hapter\s+[IVXLCDM]+|[0-9]{1,4}\s*[\.、])\s*(.*)$',
         re.MULTILINE
     )
 
@@ -432,8 +485,7 @@ class NovelAdaptationEngine:
                     got = proc.stdout.strip()
 
                 if proc.returncode != 0:
-                    why = (f"退出码 {proc.returncode}："
-                           f"{(proc.stderr or proc.stdout or '').strip()[:300]}")
+                    why = f"退出码 {proc.returncode}：{_pick_error(proc.stderr, proc.stdout)}"
                 elif not got:
                     why = "没有输出（多半是限流）"
                 else:
@@ -459,19 +511,25 @@ class NovelAdaptationEngine:
             return None
 
         work = Path(tempfile.mkdtemp(prefix="cover_"))
-        cmd = [self.config.cli_command.strip() or "agy", "--dangerously-skip-permissions"]
-        if self.config.cli_model.strip():
-            cmd += ["--model", self.config.cli_model.strip()]
-        cmd += ["--prompt",
+        exe = (self.config.cli_command.strip() or "agy")
+        tpl = COVER_ARGS.get(Path(exe).name.lower())
+        if not tpl:
+            self.log(f"不知道 {exe} 怎么开工具权限出图，改用纯排版封面。"
+                     f"（已知：{'、'.join(COVER_ARGS)}）")
+            return None
+        body = (
                 "Use your image generation tool to create ONE book cover illustration and save "
                 f"it as art.png in the current directory ({work}). Portrait orientation, "
                 "aspect ratio close to 1:1.6, no text/letters/typography anywhere in the image "
                 "(the title will be typeset separately). Do not ask questions.\n\n"
-                f"Cover art brief:\n{prompt}"]
+                f"Cover art brief:\n{prompt}")
 
-        self.log("正在让 CLI 画封面底图（这一步会临时放开工具权限，只在空目录里跑）...")
+        cmd = [exe] + build_cli_args(tpl, self.config.cli_model.strip(), body)
+        self.log(f"正在让 {Path(exe).name} 画封面底图"
+                 f"（放开工具权限，只在空目录里跑，上限 {COVER_TIMEOUT} 秒）…")
         try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=CLI_TIMEOUT, cwd=work)
+            subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=COVER_TIMEOUT, cwd=work, stdin=subprocess.DEVNULL)
         except Exception as exc:
             self.log(f"封面出图失败（{exc}），改用纯排版封面。")
             return None
@@ -777,37 +835,56 @@ Ensure all names and institutions fit the target era authentic to {self.config.t
         只有异常章节才截：章节切分失效时会出现几十万字的「一章」，那种会撑爆
         上下文，所以留个上限并打日志，让问题暴露而不是静默砍掉。
         """
+        # 原文一律完整送进去，不截断。
+        # 截断是最差的处理：静默丢内容，成品里看不出少了什么，事后也无从发现。
+        # 现代模型几十万 token 上下文，正常章节（哪怕三五万字）根本不是问题；
+        # 真的大到模型吃不下，就让这次调用报错 —— 报错能重试、能修，丢内容不能。
         src = raw_content
-        if len(src) > MAX_CHAPTER_CHARS:
-            self.log(f"⚠️ 第 {index} 章有 {len(src):,} 字，超过 {MAX_CHAPTER_CHARS:,} 上限已截断。"
-                     f"这通常说明章节切分在这里失效了，建议查一下原文。")
-            src = src[:MAX_CHAPTER_CHARS]
+        if len(src) > BIG_CHAPTER_WARN:
+            self.log(f"⚠️ 第 {index} 章有 {len(src):,} 字，异常地长（正常章节几千字）。"
+                     f"内容会完整送进去，但这通常说明章节切分在这里失效、"
+                     f"把好几章并成了一章，建议查一下原文的章节标题格式。")
         self.log(f"正在改编第 {index} 章：{raw_title}...")
 
         system_prompt = (
-            "You are an acclaimed American novelist and adaptation master. "
-            "You transform Chinese chapters into immersive, atmospheric American English (en-US) fiction. "
-            "STRICT RULES:\n"
-            "1. Retain the exact narrative causal chain, critical reveals, character decisions, and scenes.\n"
-            "2. Adopt narrative functional equivalence: seamlessly shift Chinese social mechanics into the target Western/historical setting.\n"
-            "3. Eliminate all translationese and Chinese sentence structures. Write natural, flowing prose with varied rhythm.\n"
-            "4. Show, Don't Tell: convey emotion through visceral actions, dialogue subtext, and sensory details.\n"
-            "5. Do NOT summarize or shorten into an outline. Write the complete, full-length chapter scenes.\n"
-            "6. Do NOT include meta commentary (like 'Here is the chapter'). Output only the chapter title and prose."
+            "You are an acclaimed American novelist. You do not translate — you RELOCATE "
+            "a Chinese story into a new culture so completely that a reader would never "
+            "guess it began in Chinese.\n\n"
+            "ABSOLUTE RULES — violating any of these makes the chapter unusable:\n"
+            "1. NAMES: Use ONLY the English names from the Adaptation Bible's mapping tables. "
+            "Never output a Chinese name, a pinyin transliteration (Han Li, Wang, Li Wei), "
+            "or a Chinese place name. If a character or place is not in the Bible, invent an "
+            "English name that fits the target setting and use it consistently.\n"
+            "2. TERMS: Same for every setting-specific noun — ranks, sects, techniques, items, "
+            "currency, honorifics. Use the Bible's term mapping. Never leave qi, dao, jianghu, "
+            "senior/junior brother, or similar untranslated.\n"
+            "3. SETTING: Every scene is relocated to the target setting. Architecture, clothing, "
+            "food, social hierarchy, law, religion — all rebuilt for that culture. No Chinese "
+            "cultural artifacts survive unless the Bible maps them to an equivalent.\n"
+            "4. STORY: The causal chain, reveals, decisions, and scene order are untouchable. "
+            "Relocate the story; do not rewrite the plot.\n"
+            "5. PROSE: No translationese, no Chinese sentence rhythm. Vary sentence length. "
+            "Show through action, dialogue subtext and sensory detail.\n"
+            "6. LENGTH: Write the complete chapter in full. Never summarize or outline.\n"
+            "7. OUTPUT: Chapter title and prose only. No preamble, no notes, no commentary."
         )
 
         user_prompt = f"""
-Adaptation Bible Context:
+ADAPTATION BIBLE — this is binding, not background. Every name, place and term below
+MUST be used exactly as mapped. Chapters are written independently by different workers,
+so the Bible is the only thing keeping 2000+ chapters consistent with each other.
+If you rename someone here, the series breaks.
 \"\"\"{bible_text[:MAX_BIBLE_CHARS]}\"\"\"
 
-Target Setting: {self.config.target_country}, {self.config.target_era}
+Target setting: {self.config.target_country}, {self.config.target_era}
 Genre: {self.config.genre}
 
-Original Chapter {index} Title: {raw_title}
-Original Content:
+Chinese source, chapter {index} — title: {raw_title}
 \"\"\"{src}\"\"\"
 
-Please write the complete adapted Chapter in American English.
+Rewrite this chapter as American English fiction set in the target setting.
+Relocate it completely: names, places, ranks, customs, objects. Keep the plot identical.
+Before writing, check every proper noun against the Bible's mapping tables.
 Format:
 Heading: Chapter {index}: [Engaging English Chapter Title]
 [Full novel prose paragraphs with natural dialogue and rich scene description]
@@ -984,6 +1061,242 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
         src = self.config.source_file
         return f"file:{Path(src).name}" if src else ""
 
+    def export_volumes(self, vols: List[Dict], adapted: List[Dict[str, str]],
+                       bible_md: str, proj_dir: Path, cover_src: Optional[Path]) -> List[Path]:
+        """每卷出一套完整交付物料，各自当独立的书上架。
+
+        每卷单独生成简介和关键词：系列书的每一本在 KDP 上是独立商品，
+        共用一份简介的话，第 3 卷的商品页会在讲第 1 卷的开头，读者不会买。
+        分类沿用全书的（同一个系列不该散落在不同分类里）。
+        """
+        made = []
+        base = self.config.book_title or "Untitled Adaptation"
+        for v in vols:
+            n, s, e = v["n"], v["start"], v["end"]
+            part = adapted[s - 1:e]
+            if not part:
+                continue
+            safe = re.sub(r'[\s/\\:*?"<>|]', '_', v["subtitle"])[:40]
+            vdir = proj_dir / f"Vol{n}_{safe}"
+            vdir.mkdir(parents=True, exist_ok=True)
+            # 系列书用「主标题 + 卷号 + 卷名」：KDP 靠这个把它们归成一个 series，
+            # 读者也能一眼看出顺序。每卷起个毫不相干的书名，续集就没人找得到。
+            vtitle = f"{base}: Book {n}"
+            vsub = v["subtitle"]
+
+            kdp_formatter.format_manuscript_docx(
+                title=vtitle, subtitle=vsub, author=self.config.author_name,
+                chapters=part, output_path=vdir / "01_English_Manuscript.docx")
+            kdp_formatter.format_manuscript_epub(
+                title=vtitle, subtitle=vsub, author=self.config.author_name,
+                chapters=part, output_path=vdir / "07_Manuscript.epub",
+                cover_image=cover_src if cover_src and cover_src.exists() else None)
+
+            meta = self.generate_volume_metadata(v, len(vols), bible_md, part)
+            (vdir / "03_Publishing_Copy.txt").write_text(
+                f"Title: {vtitle}\n"
+                f"Subtitle: {vsub}\n"
+                f"Author: {self.config.author_name}\n"
+                f"Series: {base}\n"
+                f"Series Volume: {n}\n"
+                f"Language: English (United States, en-US)\n\n"
+                f"--------------------------------------------------\n"
+                f"AMAZON BOOK DESCRIPTION (PLAIN TEXT):\n{meta['blurb_text']}\n\n"
+                f"--------------------------------------------------\n"
+                f"AMAZON BOOK DESCRIPTION (KDP HTML READY):\n{meta['blurb_html']}\n\n"
+                f"--------------------------------------------------\n"
+                f"KDP 7-BOX SEARCH KEYWORDS:\n"
+                + "\n".join(f"Box {i+1}: {k}" for i, k in enumerate(meta["search_keywords_7"]))
+                + "\n\n--------------------------------------------------\n"
+                f"KDP CATEGORIES (上传器按这几行逐级勾选):\n"
+                + "\n".join(f"Category {i+1}: {c}" for i, c in enumerate(meta["categories"]))
+                + f"\n\n--------------------------------------------------\n"
+                f"本卷覆盖原书第 {s}-{e} 章（共 {len(part)} 章）\n{v.get('arc','')}\n", "utf-8")
+
+            if cover_src and cover_src.exists():
+                import shutil as _sh
+                _sh.copy(cover_src, vdir / "05_Ebook_Cover.png")
+
+            made.append(vdir)
+            self.log(f"-> {vdir.name}（第 {s}-{e} 章，{len(part)} 章）")
+        return made
+
+    def generate_volume_metadata(self, vol: Dict, total_vols: int,
+                                 bible_md: str, part: List[Dict[str, str]]) -> Dict:
+        """给单独一卷生成商品页文案。分类沿用全书的，简介按本卷内容写。"""
+        sample = "\n\n".join(c["content"][:1200] for c in part[:2])
+        sys_p = ("You are an Amazon KDP copywriter for serialized fiction. "
+                 "Write copy that sells THIS volume of an ongoing series.")
+        user_p = f"""Write the Amazon product-page copy for Book {vol['n']} of {total_vols}
+in the series "{self.config.book_title}".
+
+This volume covers: {vol.get('arc', '')}
+Volume name: {vol['subtitle']}
+Genre: {self.config.genre}
+Setting: {self.config.target_country}, {self.config.target_era}
+
+Adaptation Bible:
+\"\"\"{bible_md[:MAX_BIBLE_CHARS]}\"\"\"
+
+Opening of this volume:
+\"\"\"{sample}\"\"\"
+
+Return JSON with exactly these keys:
+1. "blurb_text": 200-300 words. Hook readers on THIS volume's conflict.
+   {"Do NOT spoil later volumes." if vol['n'] < total_vols else "This is the finale."}
+   {"Mention it continues the story so far, but stay readable for newcomers." if vol['n'] > 1 else ""}
+2. "blurb_html": same copy with KDP-supported tags (<b>, <i>, <p>).
+3. "search_keywords_7": 7 backend keyword phrases for this volume.
+"""
+        raw = self._call_llm(user_p, sys_p)
+        meta = {}
+        try:
+            m = re.search(r'\{.*\}', raw, re.DOTALL)
+            if m:
+                meta = json.loads(m.group(0))
+        except Exception:
+            pass
+
+        blurb = meta.get("blurb_text") or (
+            f"Book {vol['n']} of {total_vols} in {self.config.book_title}. "
+            f"{vol.get('arc', '')}")
+        return {
+            "blurb_text": blurb,
+            "blurb_html": meta.get("blurb_html") or f"<p>{blurb}</p>",
+            "search_keywords_7": (meta.get("search_keywords_7")
+                                  or self.metadata.get("search_keywords_7") or [])[:7],
+            # 分类沿用全书：同一个系列散在不同分类里对读者和排名都不利
+            "categories": self.metadata.get("categories") or [],
+        }
+
+    def plan_volumes(self, chapters: List[Dict[str, str]], book_summary: str,
+                     proj_dir: Path) -> List[Dict]:
+        """按剧情把全书切成 3-8 卷，每卷当成独立的一本英文书上架。
+
+        切点要落在剧情的自然段落上（大战结束、境界突破、场景转移），不是按字数
+        平均分 —— 读者读完第一卷要有「告一段落但想看下去」的感觉，这直接影响
+        第一本免费、后续付费的转化。
+
+        结果缓存到 12_Volumes.json，重跑不用再花一次调用。
+        """
+        cache = proj_dir / "12_Volumes.json"
+        if cache.exists():
+            try:
+                vols = json.loads(cache.read_text("utf-8"))
+                if vols:
+                    self.log(f"复用已有的分卷方案（{len(vols)} 卷）")
+                    return vols
+            except Exception:
+                pass
+
+        total = len(chapters)
+        self.log(f"正在按剧情规划分卷（全书 {total} 章，目标 {VOL_MIN}-{VOL_MAX} 卷）…")
+
+        # 只给章节标题清单，不给正文——几千章的正文送不进去，标题足够定切点
+        titles = "\n".join(f"{i}. {c['title']}" for i, c in enumerate(chapters, 1))
+        sys_p = ("You are a series editor for Amazon Kindle. You split long web novels into "
+                 "sellable multi-book series. Output valid JSON only, no commentary.")
+        user_p = f"""Split this {total}-chapter novel into {VOL_MIN}-{VOL_MAX} volumes for release
+as a Kindle series (book 1 free, later books paid).
+
+Rules:
+- Cut on natural story breaks: an arc resolving, a power/rank breakthrough, a move to a
+  new region, a major reveal. NEVER split mid-arc just to even out length.
+- Volume 1 must end on a satisfying beat that still makes the reader want book 2.
+- Volumes may differ in length. Uneven is fine if the story demands it.
+- Cover every chapter: volume 1 starts at 1, the last ends at {total}, no gaps or overlaps.
+
+Whole-book summary:
+\"\"\"{book_summary[:MAX_SUMMARY_CHARS]}\"\"\"
+
+Chapter titles:
+\"\"\"{titles[:60000]}\"\"\"
+
+Return JSON, nothing else:
+{{"volumes": [
+  {{"n": 1, "start": 1, "end": 120,
+    "subtitle": "Short evocative volume name, 2-5 English words",
+    "arc": "One sentence: what this volume covers and why it ends here"}}
+]}}"""
+        raw = self._call_llm(user_p, sys_p)
+        vols = []
+        try:
+            m = re.search(r'\{.*\}', raw, re.DOTALL)
+            if m:
+                vols = json.loads(m.group(0)).get("volumes", [])
+        except Exception:
+            pass
+
+        vols = self._sanitize_volumes(vols, total)
+        cache.write_text(json.dumps(vols, ensure_ascii=False, indent=2), "utf-8")
+        for v in vols:
+            self.log(f"  第 {v['n']} 卷：第 {v['start']}-{v['end']} 章  《{v['subtitle']}》")
+        return vols
+
+    def _sanitize_volumes(self, vols: List[Dict], total: int) -> List[Dict]:
+        """把模型给的分卷方案修成一定能用的样子。
+
+        模型经常会漏章、重叠、或者给的卷数超范围。这些都不能直接信 ——
+        漏掉的章节会永远不出现在任何一本书里，而且不会有任何报错。
+        """
+        clean = []
+        for v in vols or []:
+            try:
+                s, e = int(v["start"]), int(v["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 1 <= s <= e <= total:
+                clean.append({"start": s, "end": e,
+                              "subtitle": str(v.get("subtitle") or "").strip(),
+                              "arc": str(v.get("arc") or "").strip()})
+        clean.sort(key=lambda x: x["start"])
+
+        if not clean:
+            # 模型完全没给可用结果：按字数均分成 VOL_MIN 卷兜底
+            self.log(f"⚠️ 分卷方案不可用，退回按章数均分 {VOL_MIN} 卷。")
+            step = max(1, total // VOL_MIN)
+            clean = [{"start": i + 1, "end": min(i + step, total), "subtitle": "", "arc": ""}
+                     for i in range(0, total, step)][:VOL_MAX]
+
+        # 首尾对齐、消除重叠和空隙：一章都不能丢
+        clean[0]["start"] = 1
+        for a, b in zip(clean, clean[1:]):
+            if b["start"] != a["end"] + 1:
+                b["start"] = a["end"] + 1
+        clean = [v for v in clean if v["start"] <= v["end"]]
+        clean[-1]["end"] = total
+
+        for i, v in enumerate(clean, 1):
+            v["n"] = i
+            if not v["subtitle"]:
+                v["subtitle"] = f"Part {i}"
+        return clean
+
+    def _find_own_project(self) -> Optional[Path]:
+        """在输出目录里找属于这本书的项目目录（靠 .owner 标记）。
+
+        为什么需要：占位目录在书名定下来之后就被改名了，下次再跑时
+        project_dir_for 指向的占位目录已经不存在 —— 不反查的话会被当成全新的书，
+        重新生成改编档案、模型给出不一样的书名、再建一个新目录，几百章白跑。
+        实测同一本书因此跑出了 My_Comeback_System… 和 My_Quest_System… 两个目录。
+        """
+        key = self._work_key()
+        if not key:
+            return None
+        root = Path(self.config.output_dir) if self.config.output_dir else Path.cwd() / "output"
+        if not root.is_dir():
+            return None
+        for d in sorted(root.iterdir()):
+            if not d.is_dir():
+                continue
+            f = d / ".owner"
+            try:
+                if f.exists() and f.read_text("utf-8").strip() == key:
+                    return d
+            except OSError:
+                continue
+        return None
+
     def _settle_project_dir(self, proj_dir: Path, bible_path: Path) -> Path:
         """书名定下来之后，把占位目录改名成书名目录（已存在同名目录就合并进去）。
 
@@ -1062,8 +1375,17 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
         """
         stage = stage_cb or (lambda _: None)
         stage("读取源文件")
-        proj_dir = project_dir_for(self.config)
+        # 先看这本书有没有跑过（靠 .owner 反查），有就直接用那个目录续跑，
+        # 别再走「占位目录 -> 重新定书名 -> 新建目录」那条路。
+        proj_dir = self._find_own_project()
+        if proj_dir:
+            if not self.config.book_title:
+                self.config.book_title = proj_dir.name.replace("_", " ")
+            self.log(f"找到这本书已有的项目目录，继续用它：{proj_dir.name}")
+        else:
+            proj_dir = project_dir_for(self.config)
         proj_dir.mkdir(parents=True, exist_ok=True)
+        self._stamp_owner(proj_dir)   # 占位目录也打标记，中途挂了也能反查到
 
         # 1. 读取并切分源文本
         self.log(f"正在读取源文件: {self.config.source_file}...")
@@ -1083,9 +1405,15 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
         # 2. 生成 Adaptation Bible（已有就直接用，省一次调用，也保证续跑时人名地名一致）
         stage("生成改编档案")
         bible_path = proj_dir / "08_Adaptation_Bible.md"
+        book_summary = ""
         if bible_path.exists() and bible_path.stat().st_size > 200:
             bible_md = bible_path.read_text("utf-8")
             self.log(f"复用已有的改编档案: {bible_path.name}（{len(bible_md)} 字符）")
+            # 档案是缓存命中的，这一轮没跑摘要 —— 但分卷要用全书总结，
+            # 从落盘的分块摘要拼回来，别为这个再花一遍调用
+            sm = sorted((proj_dir / "_summaries").glob("*.md"))
+            if sm:
+                book_summary = "\n\n---\n\n".join(p.read_text("utf-8") for p in sm)
         else:
             # 先把全书读一遍再建档案。档案会被每一章引用，做对它收益乘以章数。
             stage("通读全书")
@@ -1410,4 +1738,18 @@ Author: {self.config.author_name}
             progress_cb(1.0)
 
         self.log(f"全部改编与出版物料已就绪！项目保存在: {proj_dir}")
+        # 分卷：把全书切成若干本独立上架的英文书
+        if getattr(self.config, "split_volumes", True) and not chapter_range:
+            try:
+                stage("规划分卷")
+                vols = self.plan_volumes(chapters, book_summary, proj_dir)
+                stage("导出各卷物料")
+                made = self.export_volumes(vols, adapted_chapters, bible_md,
+                                           proj_dir, proj_dir / "05_Ebook_Cover.png")
+                self.log(f"分卷完成：{len(made)} 卷，各自可独立上架。"
+                         f"每卷目录里有自己的 01/03/05/07 四个文件。")
+            except Exception as exc:
+                # 分卷失败不能把整本的交付物料带掉 —— 全书版已经生成好了
+                self.log(f"分卷这步出错（{exc}），全书版物料不受影响。")
+
         return proj_dir
