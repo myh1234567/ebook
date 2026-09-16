@@ -7,6 +7,7 @@
 import json
 import random
 import re
+import subprocess
 import time
 from pathlib import Path
 from typing import Dict, Optional, Callable, List
@@ -219,6 +220,92 @@ class KDPPreflightChecker:
         return issues
 
 
+# ---- 用「你平时那个 Chrome」来跑上架 ----
+# 关键限制：调试端口只能在 Chrome 启动时用 --remote-debugging-port 开，
+# 对一个已经在跑的 Chrome 没有任何办法事后打开它。所以想沿用自己的登录态，
+# 只能把 Chrome 关掉、带端口重起一次（会话会保存，标签页能恢复）。
+CHROME_DEBUG_PORT = 9333
+CHROME_APP = "Google Chrome"
+CHROME_BIN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+def default_chrome_profile() -> str:
+    """macOS 上 Chrome 的真实 user-data-dir —— 你平时的 cookie 和登录态都在这儿。"""
+    return str(Path.home() / "Library/Application Support/Google/Chrome")
+
+
+def chrome_pids() -> List[int]:
+    """正在跑的 Chrome 主进程。-x 只匹配进程名，不会把渲染子进程算进来。"""
+    try:
+        out = subprocess.run(["pgrep", "-x", CHROME_APP],
+                             capture_output=True, text=True, timeout=5).stdout
+        return [int(x) for x in out.split() if x.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def debug_port_alive(port: int = CHROME_DEBUG_PORT) -> bool:
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/version", timeout=2):
+            return True
+    except Exception:
+        return False
+
+
+def quit_chrome(log=print, timeout: int = 25) -> bool:
+    """优雅退出 Chrome。走 AppleScript 而不是 kill —— 让它自己保存会话，
+    这样带端口重开之后标签页还能恢复，用户不会丢东西。"""
+    if not chrome_pids():
+        return True
+    log("正在退出当前 Chrome（会话会保存，重开可恢复标签页）…")
+    subprocess.run(["osascript", "-e", f'quit app "{CHROME_APP}"'],
+                   capture_output=True, timeout=timeout)
+    for _ in range(timeout):
+        if not chrome_pids():
+            return True
+        time.sleep(1)
+    return False
+
+
+def launch_debug_chrome(profile: str = "", profile_dir: str = "Default",
+                        port: int = CHROME_DEBUG_PORT, log=print) -> bool:
+    """带调试端口起 Chrome，默认用你真实的那个 profile（所以带着全部登录态）。
+
+    已经开着调试端口就什么都不做；开着但没端口，就先让它退出再重起。
+    """
+    if debug_port_alive(port):
+        log(f"Chrome 已经开着调试端口 {port}，不用动。")
+        return True
+
+    profile = profile or default_chrome_profile()
+    if chrome_pids():
+        # 同一个 user-data-dir 只允许一个 Chrome 实例持有。不先退出就硬起，
+        # Chrome 会退回一个临时空 profile —— 表现是「明明登录过却显示未登录」。
+        if not quit_chrome(log):
+            raise RuntimeError("Chrome 没能退出（可能有未保存的页面在拦截）。手动 Cmd+Q 再试。")
+
+    Path(profile).mkdir(parents=True, exist_ok=True)
+    args = [CHROME_BIN, f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile}",
+            "--no-first-run", "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled"]
+    if profile_dir:
+        args.append(f"--profile-directory={profile_dir}")
+    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+    for _ in range(30):
+        time.sleep(1)
+        if debug_port_alive(port):
+            log(f"Chrome 已带调试端口 {port} 起来了，profile：{profile}"
+                + (f"（{profile_dir}）" if profile_dir else ""))
+            return True
+    raise RuntimeError(f"Chrome 起来了但调试端口 {port} 没开。"
+                       f"端口可能被别的程序占了，或者 Chrome 路径不对：{CHROME_BIN}")
+
+
 class KDPBrowserUploader:
     """使用 Selenium 自动化操作 Chrome 上传至 Amazon KDP。"""
 
@@ -229,8 +316,7 @@ class KDPBrowserUploader:
 
     # 固定一个调试端口：同一个 profile 只能被一个 Chrome 占用，
     # 所以第二次上架要接管已经开着的那个，而不是再开一个（否则拿不到登录态）
-    DEBUG_PORT = 9333
-    CHROME_BIN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    DEBUG_PORT = CHROME_DEBUG_PORT
 
     def _debug_alive(self) -> bool:
         import urllib.request
@@ -254,19 +340,19 @@ class KDPBrowserUploader:
         关键：Chrome 的 user-data-dir 同一时刻只允许一个实例持有。硬开第二个的话，
         它会退回一个临时空 profile —— 表现就是「明明登录过却显示未登录」。
         """
-        import subprocess
-
         if self._debug_alive():
             self._attach()
             self.log(f"接管已在运行的 Chrome（端口 {self.DEBUG_PORT}），沿用已有登录态。")
             return
 
+        # 没配 profile 就用一个专用的：它和你日常那个 Chrome 互不干扰，
+        # 可以同时开着。配了（比如指向真实 profile）就按配的来。
         profile = Path(self.user_data_dir) if self.user_data_dir else \
             Path.home() / ".kdp_chrome_profile"
         profile.mkdir(parents=True, exist_ok=True)
 
         subprocess.Popen(
-            [self.CHROME_BIN,
+            [CHROME_BIN,
              f"--remote-debugging-port={self.DEBUG_PORT}",
              f"--user-data-dir={profile}",
              "--no-first-run", "--no-default-browser-check",
@@ -280,9 +366,18 @@ class KDPBrowserUploader:
             if self._debug_alive():
                 break
         else:
+            # 最常见的原因：这个 profile 已经被你正开着的 Chrome 占住了。
+            # 同一个 user-data-dir 只允许一个实例，而调试端口又只能在启动时开，
+            # 所以只能把它关掉带端口重起 —— 那正是 `cli.py chrome` 干的事。
+            if chrome_pids():
+                raise RuntimeError(
+                    f"Chrome 起不来：{profile} 已被正在运行的 Chrome 占用。\n"
+                    f"    调试端口只能在启动时开，没法对已经在跑的 Chrome 事后补上。\n"
+                    f"    跑一下 `python3 cli.py chrome` 把它带端口重起"
+                    f"（会话会保存，标签页能恢复），然后重试。")
             raise RuntimeError(
-                f"Chrome 起不来。多半是 {profile} 已被另一个 Chrome 占用——"
-                f"把那个窗口关掉再试。")
+                f"Chrome 起不来（profile: {profile}）。确认这个路径存在："
+                f"{CHROME_BIN}")
         self._attach()
         self.log(f"已启动 Chrome，profile: {profile}")
 
@@ -399,6 +494,61 @@ class KDPBrowserUploader:
 
     def _js(self, body: str, *args):
         return self.driver.execute_script(self.JS_MODAL + body, *args)
+
+    # 封面那一段是折叠的，不展开下面的 file input 不生效。
+    # 定位一律从「cover you already have」这段文字反查，不赌行的 class 名 ——
+    # 之前写死 .a-accordion-row-a11y，class 一换就找不到，而且是静默找不到。
+    JS_OWN_COVER = """
+    function ownCoverRow(){
+      var want='cover you already have', node=null;
+      document.querySelectorAll('span,label,h4,h5,a,div').forEach(function(e){
+        if(node) return;
+        // 只认最里层那个承载文字的节点，否则会一路匹配到 body
+        if((e.textContent||'').toLowerCase().indexOf(want)>-1
+           && e.querySelectorAll('*').length<6) node=e;
+      });
+      if(!node) return null;
+      return node.closest('.a-accordion-row-a11y') || node.closest('.a-accordion-row')
+          || node.closest('label') || node.closest('a') || node;
+    }
+    function ownCoverRadio(row){
+      if(!row) return null;
+      return row.querySelector('input[type=radio]')
+          || (row.closest('.a-accordion-row')
+              ? row.closest('.a-accordion-row').querySelector('input[type=radio]') : null);
+    }
+    """
+
+    def _pick_own_cover(self, timeout: int = 20):
+        """选中「Upload a cover you already have (JPG/TIFF only)」并等它展开。
+
+        必须确认真的选上了：这一步静默失败的话，后面往 file input 塞封面不生效，
+        日志里却一路正常，最后在 Amazon 上看到的是一本没有封面的书。
+        """
+        r = self.driver.execute_script(self.JS_OWN_COVER + """
+            var row=ownCoverRow();
+            if(!row) return {ok:false};
+            row.scrollIntoView({block:'center'});
+            var radio=ownCoverRadio(row);
+            (radio||row).click();
+            return {ok:true, label:(row.textContent||'').trim().slice(0,60)};
+        """) or {}
+        if not r.get("ok"):
+            raise RuntimeError("封面步骤：页面上找不到「upload a cover you already have」这一项")
+        self.log(f"  · 已选「{r.get('label', '')}」")
+
+        for _ in range(timeout):
+            time.sleep(1)
+            st = self.driver.execute_script(self.JS_OWN_COVER + """
+                var row=ownCoverRow(), radio=ownCoverRadio(row);
+                var inp=document.getElementById(arguments[0]);
+                return {hasInput:!!inp, checked: radio ? !!radio.checked : null};
+            """, self.F_COVER) or {}
+            # 没有单选钮（纯折叠面板）时，上传框挂上来就算展开成功
+            if st.get("hasInput") and st.get("checked") is not False:
+                return
+        raise RuntimeError(
+            f"封面步骤：点了「上传自有封面」但没展开（上传框 #{self.F_COVER} 没出现）")
 
     def _wait_categories_button(self, timeout: int = 90):
         """等「Choose categories」真正可点。
@@ -632,13 +782,9 @@ class KDPBrowserUploader:
                            "正文上传", 300, settle=self.UPLOAD_SETTLE)
 
         if meta.cover_path:
-            # 「上传自有封面」是折叠的，不展开的话下面的 input 根本不生效
-            self.driver.execute_script(
-                "var hit=null;"
-                "document.querySelectorAll('.a-accordion-row-a11y').forEach(function(e){"
-                " if((e.textContent||'').indexOf('cover you already have')>-1) hit=e;});"
-                "if(hit){hit.scrollIntoView({block:'center'}); hit.click();}")
-            time.sleep(3)
+            # 「上传自有封面」是折叠的，不展开的话下面的 input 根本不生效。
+            # 选不中会抛错，不再静默往下走。
+            self._pick_own_cover()
             jpg = self._cover_as_jpg(meta.cover_path)
             self.driver.find_element("id", self.F_COVER).send_keys(jpg)
             self.log(f"  · 正在上传封面 {Path(jpg).name} …")

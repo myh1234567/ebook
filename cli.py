@@ -179,18 +179,24 @@ def load_cfg(args):
 KDP_UPLOADED_MARK = ".kdp_uploaded"
 
 
-def _book_dirs(proj_dir: Path):
+def _vol_no(d: Path) -> int:
+    """目录名里的卷号，Vol7_Xxx -> 7。不是分卷目录就返回 0。"""
+    m = re.match(r"Vol(\d+)", d.name)
+    return int(m.group(1)) if m else 0
+
+
+def _book_dirs(proj_dir: Path, only_vols=None):
     """这个项目要上架几本书。分卷了就是各卷目录，没分卷就是项目本身。
 
     按卷号数字排序，不能用字典序 —— Vol10 会排到 Vol2 前面去。
+    only_vols 给一组卷号时只留这几本（`kdp-upload --vol 3` 走这条）。
     """
-    vols = []
-    for d in proj_dir.glob("Vol*"):
-        if not d.is_dir() or not (d / "03_Publishing_Copy.txt").exists():
-            continue
-        m = re.match(r"Vol(\d+)", d.name)
-        vols.append((int(m.group(1)) if m else 0, d))
-    return [d for _, d in sorted(vols, key=lambda t: t[0])] or [proj_dir]
+    vols = [d for d in proj_dir.glob("Vol*")
+            if d.is_dir() and (d / "03_Publishing_Copy.txt").exists()]
+    vols.sort(key=_vol_no)
+    if only_vols:
+        vols = [d for d in vols if _vol_no(d) in set(only_vols)]
+    return vols or ([proj_dir] if not only_vols else [])
 
 
 def _kdp_post_one(settings, book_dir: Path, upload_one, do_pub: bool):
@@ -208,21 +214,32 @@ def _kdp_post_one(settings, book_dir: Path, upload_one, do_pub: bool):
     return True, f"✅ {book_dir.name}：{meta.title}"
 
 
-def run_kdp_autopost(settings, proj_dir) -> str:
+def run_kdp_autopost(settings, proj_dir, limit: int = 0,
+                     do_publish=None, redo: bool = False, only_vols=None) -> str:
     """改编跑完直接建 KDP 草稿。分卷了就一卷一本，逐本上架。
 
     发布与否看 kdp_auto_publish：点了 Publish 就撤不回来了，所以默认只到草稿。
+
+    limit / do_publish / redo 是给 `cli.py kdp-upload` 试跑用的：
+    只传前几本、强制只建草稿、忽略已传标记重来。
     """
     try:
         proj_dir = Path(proj_dir)
-        books = _book_dirs(proj_dir)
-        todo = [b for b in books if not (b / KDP_UPLOADED_MARK).exists()]
+        books = _book_dirs(proj_dir, only_vols)
+        if not books:
+            return f"⚠️ *没有上架*：`{proj_dir.name}` 里没有第 {only_vols} 卷"
+        todo = books if redo else [b for b in books
+                                   if not (b / KDP_UPLOADED_MARK).exists()]
         done = len(books) - len(todo)
         if not todo:
             return (f"📚 这 {len(books)} 本之前都传过了，跳过。"
-                    f"要重传就删掉各自目录里的 `{KDP_UPLOADED_MARK}`")
+                    f"要重传就删掉各自目录里的 `{KDP_UPLOADED_MARK}`，"
+                    f"或者用 `cli.py kdp-upload --redo`")
+        if limit:
+            todo = todo[:limit]
 
-        do_pub = bool(getattr(settings, "kdp_auto_publish", False))
+        do_pub = (bool(getattr(settings, "kdp_auto_publish", False))
+                  if do_publish is None else bool(do_publish))
         print(f"\n📤 开始自动上架：{len(todo)} 本"
               + (f"（另有 {done} 本传过了，跳过）" if done else "")
               + f"，自动发布={do_pub}")
@@ -253,6 +270,77 @@ def run_kdp_autopost(settings, proj_dir) -> str:
         return head + "\n" + "\n".join(lines)
     except Exception as exc:
         return f"⚠️ *自动上架失败*：{exc}"
+
+
+def run_kdp_upload(args):
+    """拿一本已经生成好的书去试上架，不用重跑改编。
+
+    默认只建草稿，哪怕 settings 里 kdp_auto_publish 是开的 —— 这条命令就是用来
+    试跑的，草稿在 KDP 网页上能直接删，发布出去撤不回来。真要发得显式 --publish。
+    """
+    s = Settings.load() if hasattr(Settings, "load") else Settings()
+    if SETTINGS_FILE.exists():
+        try:
+            for k, v in json.loads(SETTINGS_FILE.read_text(encoding="utf-8")).items():
+                if hasattr(s, k):
+                    setattr(s, k, v)
+        except Exception:
+            pass
+
+    # 路径必须显式给。原来是「没给就取 output 下最近改动的那个」—— 多本书时那就是
+    # 在猜，猜错就是把 B 书的卷传到 Amazon 上，而且每本里都有 Vol1、光看卷号分不出谁的。
+    proj = Path(args.proj).expanduser().resolve()
+    if not proj.exists():
+        print(f"❌ 目录不存在：{proj}")
+        return
+
+    # --vol 3 / --vol 1,3,5：只挑这几卷
+    only = [int(x) for x in re.split(r"[,\s]+", args.vol or "") if x.strip().isdigit()]
+    books = _book_dirs(proj, only)
+    if not books:
+        print(f"❌ {proj.name} 里没有第 {only} 卷。有的是："
+              f"{[d.name for d in _book_dirs(proj)]}")
+        return
+    print(f"🔍 项目：{proj}")
+    print(f"   共 {len(books)} 本" + ("（分卷）" if books != [proj] else "（单本）"))
+    if only:
+        print(f"   只传第 {only} 卷")
+    if args.limit:
+        print(f"   本次只传前 {args.limit} 本")
+    print(f"   模式：{'⚠️ 真发布（撤不回来）' if args.publish else '只建草稿（可删）'}")
+    if args.dry_run:
+        for b in (books[:args.limit] if args.limit else books):
+            meta = kdp_uploader.KDPMetadata.load_from_project_dir(b)
+            bad = [i for i in kdp_uploader.KDPPreflightChecker.check(meta)
+                   if i.startswith("【严重】")]
+            mark = "✅" if not bad else "❌"
+            done = "（传过了）" if (b / KDP_UPLOADED_MARK).exists() else ""
+            print(f"   {mark} {b.name}{done} → {meta.title or '(书名为空)'}")
+            for i in bad:
+                print(f"        {i}")
+        print("\n（--dry-run：只看不传，没碰浏览器）")
+        return
+
+    print(run_kdp_autopost(s, proj, limit=args.limit, do_publish=args.publish,
+                           redo=args.redo, only_vols=only))
+
+
+def run_chrome(args):
+    """把 Chrome 带调试端口重起，用你自己的 profile，这样上架时沿用已有登录态。
+
+    Chrome 的调试端口只能在启动时用 --remote-debugging-port 打开，没有任何办法
+    对一个已经在跑的 Chrome 事后补上。所以只能关掉重起 —— 走 AppleScript 优雅退出，
+    会话会保存，重开后标签页能恢复。
+    """
+    profile = args.profile or kdp_uploader.default_chrome_profile()
+    print(f"profile: {profile}")
+    print(f"profile-directory: {args.profile_dir}")
+    kdp_uploader.launch_debug_chrome(
+        profile=profile, profile_dir=args.profile_dir,
+        port=args.port, log=print)
+    print("\n好了。这就是你平时那个 Chrome，cookie、书签、登录态都在，照常用。")
+    print("上架时脚本会自动接管它，不再另开窗口。")
+    print("注意：上传跑着的时候别翻页/切标签/关窗口，会打断它。")
 
 
 def run_batch(args):
@@ -557,6 +645,33 @@ def main():
         "kdp-categories", help="从真实 KDP 分类弹层扒下整棵分类树，写入 kdp_categories.json")
     p_cat.add_argument("--out", type=str, default="", help="输出路径，默认 kdp_categories.json")
 
+    # 7. 拿已经生成好的书去试上架（默认只建草稿）
+    p_up = subparsers.add_parser(
+        "kdp-upload", help="拿已经生成好的书去上架，不用重跑改编；默认只建草稿")
+    p_up.add_argument("--proj", type=str, required=True,
+                      help="要传的目录，必填。给书的目录就传它下面所有卷，"
+                           "给某个卷目录就只传那一卷。例："
+                           "output/Book1 或 output/Book1/Vol1_Xxx")
+    p_up.add_argument("--vol", type=str, default="",
+                      help="只传指定卷，比如 --vol 3 或 --vol 1,3,5")
+    p_up.add_argument("--limit", type=int, default=0, help="只传前几本，试跑时填 1")
+    p_up.add_argument("--redo", action="store_true",
+                      help="忽略 .kdp_uploaded 标记，已传过的也重传")
+    p_up.add_argument("--dry-run", dest="dry_run", action="store_true",
+                      help="只列出要传哪几本并跑预检，不碰浏览器")
+    p_up.add_argument("--publish", action="store_true",
+                      help="真的点发布（撤不回来）。不给就只建草稿")
+
+    # 8. 把 Chrome 带调试端口重起，好让上架沿用你自己的登录态
+    p_chrome = subparsers.add_parser(
+        "chrome", help="用你自己的 Chrome profile 带调试端口重起，上架时直接复用登录态")
+    p_chrome.add_argument("--profile", type=str, default="",
+                          help="user-data-dir，默认你真实的 Chrome 目录")
+    p_chrome.add_argument("--profile-dir", dest="profile_dir", type=str, default="Default",
+                          help="profile 子目录，多账号时可能是 Profile 1、Profile 2")
+    p_chrome.add_argument("--port", type=int, default=kdp_uploader.CHROME_DEBUG_PORT,
+                          help="调试端口，默认 9333")
+
     args = parser.parse_args()
 
     if args.command == "video":
@@ -573,6 +688,10 @@ def main():
         daemonize_or_run(run_batch, args, "Drive 批量改编与上架")
     elif args.command == "kdp-categories":
         run_kdp_categories(args)
+    elif args.command == "chrome":
+        run_chrome(args)
+    elif args.command == "kdp-upload":
+        run_kdp_upload(args)
 
 
 if __name__ == "__main__":
