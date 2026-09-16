@@ -1564,16 +1564,25 @@ Return JSON, nothing else:
         stage("导出交付文件")
         self.log("正在导出符合 Amazon KDP 规范的标准母稿与出版物料...")
 
+        # 开了分卷就不出全书版的正文：上架的是分卷，全书版不会被用到。
+        # 而它恰恰是最贵的一步 —— python-docx 把整个文档树建在内存里，
+        # 2450 章的真实英文长文要涨到几个 G，8G 的机器会被拖进重度交换甚至 OOM。
+        # 分卷的 docx/epub 每本只有几百章，轻松得多。
+        whole_book = not getattr(self.config, "split_volumes", True)
+        if not whole_book:
+            self.log("已开分卷，跳过全书版正文。分卷各自的正文照常生成。")
+
         # 01_English_Manuscript.docx
         manuscript_path = proj_dir / "01_English_Manuscript.docx"
-        kdp_formatter.format_manuscript_docx(
-            title=self.config.book_title,
-            author=self.config.author_name,
-            chapters=adapted_chapters,
-            output_path=manuscript_path,
-            subtitle=self.config.subtitle
-        )
-        self.log("-> 01_English_Manuscript.docx (母稿排版完成)")
+        if whole_book:
+            kdp_formatter.format_manuscript_docx(
+                title=self.config.book_title,
+                author=self.config.author_name,
+                chapters=adapted_chapters,
+                output_path=manuscript_path,
+                subtitle=self.config.subtitle,
+            )
+            self.log("-> 01_English_Manuscript.docx (母稿排版完成)")
 
         # 02_Publishing_Copy.docx & 03_Publishing_Copy.txt
         pub_docx = proj_dir / "02_Publishing_Copy.docx"
@@ -1666,15 +1675,16 @@ KDP CATEGORIES (上传器按这几行逐级勾选，改的话必须是 KDP 分�
 
         # 07_Manuscript.epub：KDP 电子书首选格式，排版由我们说了算
         epub_path = proj_dir / "07_Manuscript.epub"
-        kdp_formatter.format_manuscript_epub(
-            title=self.config.book_title,
-            author=self.config.author_name,
-            chapters=adapted_chapters,
-            output_path=epub_path,
-            subtitle=self.config.subtitle,
-            cover_image=cover_path if cover_path.exists() else None
-        )
-        self.log("-> 07_Manuscript.epub (含目录与封面，可直接上传 KDP)")
+        if whole_book:
+            kdp_formatter.format_manuscript_epub(
+                title=self.config.book_title,
+                author=self.config.author_name,
+                chapters=adapted_chapters,
+                output_path=epub_path,
+                subtitle=self.config.subtitle,
+                cover_image=cover_path if cover_path.exists() else None,
+            )
+            self.log("-> 07_Manuscript.epub (含目录与封面，可直接上传 KDP)")
 
         # 09_Image_Prompts.txt
         prompts_txt = proj_dir / "09_Image_Prompts.txt"
