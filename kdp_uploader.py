@@ -378,6 +378,17 @@ def launch_debug_chrome(profile: str = "", profile_dir: str = "Default",
             f"检测到的 profile 路径不存在：{profile}\n"
             f"    用 --profile 显式指定一个，或者先确认那个 Chrome 还开着。")
 
+    # Chrome 136 起，默认 user-data-dir 下 --remote-debugging-port 被静默忽略：
+    # 不报错、不提示，Chrome 正常起来但端口就是没有。不提前拦的话，这里会白等
+    # 30 秒超时，然后给一个「端口没开」的笼统报错，根本看不出是这个原因。
+    if Path(profile).resolve() == Path(default_chrome_profile()).resolve():
+        raise RuntimeError(
+            "这是 Chrome 的默认 profile 目录，从 Chrome 136 起，"
+            "调试端口在默认目录下会被静默忽略，起了也连不上。\n"
+            "    改用：python3 cli.py chrome --copy\n"
+            "    它会把登录态复制到一个非默认目录再起，"
+            "你日常这个 Chrome 不用动，两个可以同时开着。")
+
     if chrome_pids():
         # 同一个 user-data-dir 只允许一个 Chrome 实例持有。不先退出就硬起，
         # Chrome 会退回一个临时空 profile —— 表现是「明明登录过却显示未登录」。
