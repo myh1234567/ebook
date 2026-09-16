@@ -522,6 +522,19 @@ class NovelAdaptationEngine:
                 f"it as art.png in the current directory ({work}). Portrait orientation, "
                 "aspect ratio close to 1:1.6, no text/letters/typography anywhere in the image "
                 "(the title will be typeset separately). Do not ask questions.\n\n"
+                # 书名从高度 9.5% 往下排，作者名在 90.5%，人头顶在画面上半部就会被字盖住。
+                # 所以构图要求写死在这里，不靠每次的 brief 去提。
+                "COMPOSITION (hard requirement): the top 45% of the frame must stay visually "
+                "quiet and open — sky, mist, distant landscape, empty wall. Title type is laid "
+                "over that band. Place the main figure LOW in the frame: the head sits roughly "
+                "60-70% of the way down from the top, well inside the lower half. Never put a "
+                "head, face, or any key detail in the upper third. Keep the bottom 10% clear "
+                "too — the author name goes there.\n\n"
+                "STYLE (hard requirement): photorealistic cinematic photography. Real human "
+                "anatomy, real skin and fabric texture, natural or practical lighting, shallow "
+                "depth of field, colour-graded like a still frame from a live-action film. "
+                "NOT anime, NOT manga, NOT comic book or cel-shaded, NOT cartoon, NOT a "
+                "stylised digital painting.\n\n"
                 f"Cover art brief:\n{prompt}")
 
         cmd = [exe] + build_cli_args(tpl, self.config.cli_model.strip(), body)
@@ -946,6 +959,10 @@ Please generate a JSON object with the following exact keys:
 7. "search_keywords_7": Array of 7 search keyword phrases optimized for KDP's 7 backend boxes.
 8. "synopsis": Internal complete synopsis (500-800 words containing full ending and plot reveals).
 9. "cover_prompt": Detailed English text-to-image prompt for generating the Ebook cover art.
+   Describe subject, setting, wardrobe, weather, light and mood. Photorealistic cinematic
+   photography only — never ask for anime, manga, comic, cartoon, cel-shaded, oil painting
+   or other stylised illustration. Compose with the main figure low in the frame and the
+   top of the image open and quiet; title type is laid over that upper band.
 10. "poster_prompt": English text-to-image prompt for promotional poster.
 
 KDP CATEGORY LIST (the ONLY valid values for "categories"):
@@ -1021,7 +1038,9 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
                 "cover_prompt": (
                     f"Cinematic book cover art for a {self.config.genre} novel set in {self.config.target_era} {self.config.target_country}. "
                     f"A rugged man in a dark winter trench coat and wide-brimmed hat stands on a wooden boardwalk of a 19th-century mountain town. "
-                    f"Snow flurries in the cold dusk air, warm amber lantern glow from saloons in the background, dramatic lighting, moody, oil painting style, highly detailed --ar 1:1.6"
+                    f"Shot from low and slightly behind so he sits in the lower half of the frame, cold empty dusk sky filling the top. "
+                    f"Snow flurries in the cold air, warm amber lantern glow from saloons in the background, dramatic natural lighting, moody, "
+                    f"photorealistic cinematic film still, shallow depth of field, highly detailed --ar 1:1.6"
                 ),
                 "poster_prompt": (
                     f"Promotional poster art for '{title}'. Dramatic silhouette of a 19th-century frontier railway town at sunset. "
