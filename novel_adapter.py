@@ -1113,9 +1113,32 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
                 + f"\n\n--------------------------------------------------\n"
                 f"本卷覆盖原书第 {s}-{e} 章（共 {len(part)} 章）\n{v.get('arc','')}\n", "utf-8")
 
-            if cover_src and cover_src.exists():
-                import shutil as _sh
-                _sh.copy(cover_src, vdir / "05_Ebook_Cover.png")
+            # 每卷画自己的底图：三本书用同一张图的话，读者在商品页上
+            # 分不出哪本是第几卷，系列感也出不来。提示词带上本卷剧情，
+            # 同时锁定统一的美术风格，让几本放在一起像一个系列。
+            vart = vdir / "06_Cover_Art_Raw.png"
+            if not vart.exists():
+                self.generate_cover_art(
+                    f"Book {n} of the series \"{base}\", volume subtitle \"{vsub}\". "
+                    f"This volume covers: {v.get('arc', '')}. "
+                    f"Genre: {self.config.genre}. Setting: {self.config.target_country}, "
+                    f"{self.config.target_era}. Keep the same art direction, palette and "
+                    f"mood across the whole series so the covers read as one set, but make "
+                    f"THIS cover's subject clearly different from the other volumes.",
+                    vart)
+            # 画不出来（额度用完、CLI 没有出图工具）就退回全书那张底图，
+            # 至少各卷压的文字不同，还能分辨
+            bg = vart if vart.exists() else (
+                cover_src if (cover_src and cover_src.exists()) else None)
+            try:
+                kdp_formatter.create_cover_graphic(
+                    title=base, subtitle=f"Book {n} — {vsub}",
+                    author=self.config.author_name,
+                    tagline=v.get("arc", "")[:80],
+                    output_path=vdir / "05_Ebook_Cover.png",
+                    background=bg)
+            except Exception as exc:
+                self.log(f"  · 第 {n} 卷封面合成失败（{exc}）")
 
             made.append(vdir)
             self.log(f"-> {vdir.name}（第 {s}-{e} 章，{len(part)} 章）")
@@ -1148,14 +1171,15 @@ Return JSON with exactly these keys:
 2. "blurb_html": same copy with KDP-supported tags (<b>, <i>, <p>).
 3. "search_keywords_7": 7 backend keyword phrases for this volume.
 """
-        raw = self._call_llm(user_p, sys_p)
         meta = {}
         try:
+            raw = self._call_llm(user_p, sys_p)
             m = re.search(r'\{.*\}', raw, re.DOTALL)
             if m:
                 meta = json.loads(m.group(0))
-        except Exception:
-            pass
+        except Exception as exc:
+            self.log(f"  · 第 {vol['n']} 卷的文案没生成（{exc}），先用占位，"
+                     f"上架前记得补。")
 
         blurb = meta.get("blurb_text") or (
             f"Book {vol['n']} of {total_vols} in {self.config.book_title}. "
@@ -1218,14 +1242,17 @@ Return JSON, nothing else:
     "subtitle": "Short evocative volume name, 2-5 English words",
     "arc": "One sentence: what this volume covers and why it ends here"}}
 ]}}"""
-        raw = self._call_llm(user_p, sys_p)
+        # 模型调不通（额度用光、限流）不能让分卷整个泡汤 ——
+        # 章节都改编好了，退回按章数均分也比一本书都出不来强。
         vols = []
         try:
+            raw = self._call_llm(user_p, sys_p)
             m = re.search(r'\{.*\}', raw, re.DOTALL)
             if m:
                 vols = json.loads(m.group(0)).get("volumes", [])
-        except Exception:
-            pass
+        except Exception as exc:
+            self.log(f"⚠️ 分卷规划调模型失败（{exc}），退回按章数均分。"
+                     f"额度恢复后删掉 12_Volumes.json 重跑可拿到按剧情的切分。")
 
         vols = self._sanitize_volumes(vols, total)
         cache.write_text(json.dumps(vols, ensure_ascii=False, indent=2), "utf-8")
@@ -1254,9 +1281,13 @@ Return JSON, nothing else:
         if not clean:
             # 模型完全没给可用结果：按字数均分成 VOL_MIN 卷兜底
             self.log(f"⚠️ 分卷方案不可用，退回按章数均分 {VOL_MIN} 卷。")
-            step = max(1, total // VOL_MIN)
-            clean = [{"start": i + 1, "end": min(i + step, total), "subtitle": "", "arc": ""}
-                     for i in range(0, total, step)][:VOL_MAX]
+            # 用 ceil 分，余数摊在最后一卷里 —— 用 floor 的话
+            # 2450 章分 3 卷会多出个只有 2 章的尾巴卷，那不成一本书。
+            k = VOL_MIN
+            step = -(-total // k)
+            clean = [{"start": i * step + 1, "end": min((i + 1) * step, total),
+                      "subtitle": "", "arc": ""} for i in range(k)]
+            clean = [v for v in clean if v["start"] <= total]
 
         # 首尾对齐、消除重叠和空隙：一章都不能丢
         clean[0]["start"] = 1
@@ -1379,7 +1410,10 @@ Return JSON, nothing else:
         # 别再走「占位目录 -> 重新定书名 -> 新建目录」那条路。
         proj_dir = self._find_own_project()
         if proj_dir:
-            if not self.config.book_title:
+            # 目录名只有在它已经是真书名时才能当书名用。
+            # _wip_xxx 是书名还没定下来时的占位名，拿它当书名的话：
+            # 目录永远不会改名、分卷会叫「_wip_xxx: Book 1」、封面上也印这串。
+            if not self.config.book_title and not proj_dir.name.startswith("_wip_"):
                 self.config.book_title = proj_dir.name.replace("_", " ")
             self.log(f"找到这本书已有的项目目录，继续用它：{proj_dir.name}")
         else:
