@@ -347,6 +347,23 @@ def run_chrome(args):
 
     profile = args.profile or ""
     print()
+
+    if args.copy:
+        # Chrome 136 起，默认 profile 目录下调试端口会被静默忽略。
+        # 所以把登录态复制到一个非默认目录，从副本起 —— 你日常那个 Chrome
+        # 不用动，之后两个可以同时开着，各用各的 profile。
+        src = profile or udd or kdp_uploader.default_chrome_profile()
+        if pids and not kdp_uploader.quit_chrome(print):
+            print("❌ Chrome 没能退出，手动 Cmd+Q 再试")
+            return
+        dst = kdp_uploader.copy_chrome_profile(src, log=print)
+        kdp_uploader.launch_debug_chrome(profile=str(dst), profile_dir="Default",
+                                         port=args.port, log=print)
+        print(f"\n好了。这个 Chrome 带着你的登录态，专门用来上架。")
+        print(f"   profile: {dst}")
+        print(f"   你日常那个 Chrome 现在可以正常打开，互不影响。")
+        print(f"   登录态是复制那一刻的快照，过期了就在这个窗口里重新登一次。")
+        return
     kdp_uploader.launch_debug_chrome(
         profile=profile, profile_dir=args.profile_dir,
         port=args.port, log=print)
@@ -677,6 +694,9 @@ def main():
     # 8. 把 Chrome 带调试端口重起，好让上架沿用你自己的登录态
     p_chrome = subparsers.add_parser(
         "chrome", help="用你自己的 Chrome profile 带调试端口重起，上架时直接复用登录态")
+    p_chrome.add_argument("--copy", action="store_true",
+                          help="把登录态复制到一个非默认 profile 再起。"
+                               "Chrome 136+ 在默认 profile 下会忽略调试端口，用这个绕开")
     p_chrome.add_argument("--detect", action="store_true",
                           help="只报告当前 Chrome 用的哪个 profile、端口开没开，不动它")
     p_chrome.add_argument("--profile", type=str, default="",

@@ -251,13 +251,15 @@ def running_chrome_profile():
                              capture_output=True, text=True, timeout=5).stdout
     except Exception:
         return "", ""
-    udd = prof = ""
-    for tok in cmd.split():
-        if tok.startswith("--user-data-dir="):
-            udd = tok.split("=", 1)[1]
-        elif tok.startswith("--profile-directory="):
-            prof = tok.split("=", 1)[1]
-    return udd, prof
+    # 不能按空白切！真实路径里就有空格（.../Library/Application Support/...），
+    # 而 ps 的输出不保留引号，按空白切会把路径截成 ".../Library/Application"，
+    # 然后拿着这个不存在的路径去起 Chrome，profile 是空的、登录态一个没有。
+    # Chrome 的参数都以 -- 开头，所以取到「下一个 --参数」或行尾为止。
+    def grab(flag: str) -> str:
+        m = re.search(rf"{flag}=(.+?)(?=\s+--|\s*$)", cmd)
+        return m.group(1).strip() if m else ""
+
+    return grab("--user-data-dir"), grab("--profile-directory")
 
 
 def chrome_pids() -> List[int]:
@@ -278,6 +280,55 @@ def debug_port_alive(port: int = CHROME_DEBUG_PORT) -> bool:
             return True
     except Exception:
         return False
+
+
+# Chrome 136 起，--remote-debugging-port 在「默认 user-data-dir」下会被静默忽略
+# （Google 的安全限制，不报错、不提示，端口就是起不来）。所以要用自己的登录态，
+# 只能把 profile 复制到一个非默认目录，再从副本起带端口的 Chrome。
+# 好处是你日常那个 Chrome 完全不用动，两个可以同时开着。
+COPY_PROFILE = Path.home() / ".kdp_chrome_profile"
+
+# 只搬登录态相关的，不搬缓存 —— 完整 profile 动辄几个 G，而登录只靠这几样。
+PROFILE_BITS = ["Local State", "Default/Cookies", "Default/Cookies-journal",
+                "Default/Login Data", "Default/Login Data-journal",
+                "Default/Preferences", "Default/Web Data", "Default/Local Storage",
+                "Default/Network/Cookies", "Default/Network/Cookies-journal"]
+
+
+def copy_chrome_profile(src: str = "", dst: Path = COPY_PROFILE, log=print) -> Path:
+    """把登录态从真实 profile 复制到一个非默认目录。
+
+    要求 Chrome 已经退出：Cookies 是活动的 SQLite 文件，边写边拷会拷出半截。
+    """
+    import shutil
+    src_p = Path(src or default_chrome_profile())
+    if not src_p.exists():
+        raise RuntimeError(f"源 profile 不存在：{src_p}")
+    if chrome_pids():
+        raise RuntimeError("Chrome 还开着。Cookies 是活动的数据库文件，"
+                           "边写边拷会拷坏。先退出 Chrome 再来。")
+
+    dst.mkdir(parents=True, exist_ok=True)
+    (dst / "Default").mkdir(exist_ok=True)
+    got = 0
+    for rel in PROFILE_BITS:
+        s = src_p / rel
+        if not s.exists():
+            continue
+        d = dst / rel
+        d.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if s.is_dir():
+                shutil.copytree(s, d, dirs_exist_ok=True)
+            else:
+                shutil.copy2(s, d)
+            got += 1
+        except Exception as exc:
+            log(f"  · {rel} 没拷过来（{exc}）")
+    if not got:
+        raise RuntimeError(f"{src_p} 里一个登录态文件都没找到，路径对吗？")
+    log(f"已复制 {got} 项登录态：{src_p}  →  {dst}")
+    return dst
 
 
 def quit_chrome(log=print, timeout: int = 25) -> bool:
