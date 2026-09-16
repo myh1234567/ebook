@@ -2,6 +2,10 @@
 # Google 服务账号私钥。文件名是 Google 随机生成的（项目名-随机串.json），
 # 所以按内容特征挡不住，这里把常见形态都列上。
 kdp-writer-*.json
+# Google Cloud 下载的密钥统一是 <项目名>-<12位十六进制>.json，
+# 项目名各不相同（kdp-writer-508623-…、heroic-bliss-508718-…），
+# 只按项目名写规则挡不住下一个项目，所以按文件名格式匹配。
+*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].json
 *-service-account*.json
 service_account*.json
 sa.json
