@@ -118,6 +118,7 @@ Drive 文件夹里每个 txt 是一本待改编的书。**不用指定书名**�
 ```bash
 python3 cli.py batch --list        # 先看队列：哪些待处理、哪些完成了
 python3 cli.py batch --limit 1     # 跑一本（第一次务必先这样试）
+python3 cli.py batch --only 赤心巡天 # 点名跑某一本（书名片段 / fileId 都认）
 python3 cli.py batch               # 一直跑到队列空
 python3 cli.py batch --retry-failed # 把失败的打回待处理再跑
 ```

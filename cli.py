@@ -420,7 +420,7 @@ def run_batch(args):
     gap = args.gap if args.gap is not None else getattr(s, "batch_gap_minutes", 0.0)
     t0 = time.time()
     tally = batch.run_batch(folder, s, log=print, sa_path=sa,
-                            gap_minutes=gap, limit=args.limit)
+                            gap_minutes=gap, limit=args.limit, only=args.only)
     msg = (f"📚 *Drive 批量结束*\n\n"
            f"完成 {tally['done']} 本，跳过 {tally['skip']} 本，失败 {tally['fail']} 本\n"
            f"⏱️ 总耗时 {(time.time() - t0) / 60:.0f} 分钟")
@@ -665,6 +665,8 @@ def main():
     p_batch.add_argument("--folder", type=str, default="", help="Drive 文件夹名或 ID")
     p_batch.add_argument("--list", action="store_true", help="只看队列，不跑")
     p_batch.add_argument("--limit", type=int, default=0, help="本次最多跑几本")
+    p_batch.add_argument("--only", type=str, default="",
+                         help="只跑点名的这一本：书名片段 / Drive fileId 都认")
     p_batch.add_argument("--gap", type=float, default=None, help="每本之间隔几分钟")
     p_batch.add_argument("--retry-failed", action="store_true", help="把失败的打回待处理")
     p_batch.add_argument("--bg", action="store_true", help="后台脱机运行，完成后 Telegram 通知")
