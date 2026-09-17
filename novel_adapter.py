@@ -204,6 +204,23 @@ def names_in_chapter(raw: str, registry: Dict[str, str]) -> Dict[str, str]:
     return {zh: en for zh, en in registry.items() if zh in raw}
 
 
+def name_was_used(en: str, body: str) -> bool:
+    """这一章到底有没有按映射表用这个名字。
+
+    不能要求全名原样出现。英文小说介绍一次全名之后，通篇都只叫名或只叫姓 ——
+    实测已完成的那本书里，506 章出现主角，只有 3 章写过全名 "Luke Yarrow"，
+    其余 503 章全是 "Luke"。按全名比对的话，正确的译稿会被整章判死、整章重跑。
+
+    所以只比对名和姓：任一个作为独立单词出现，就算这一章守了表。加词边界是
+    防止 "Lee" 命中 "Leeds"；姓也认，是因为有些角色通篇被人直呼其姓。
+    """
+    tokens = [t for t in re.findall(r"[A-Za-z']+", en) if len(t) >= 3]
+    if not tokens:
+        return en in body
+    return any(re.search(rf"\b{re.escape(t)}\b", body)
+               for t in (tokens[0], tokens[-1]))
+
+
 def is_placeholder_title(name: str) -> bool:
     """判断一个名字是不是占位名（目录名的下划线形态也算）。"""
     n = (name or "").replace("_", " ").strip().lower()
@@ -502,11 +519,13 @@ _FALLBACK_SETTINGS = {
 DETECTED_FIELDS = ("orig_era_region", "target_country", "target_era",
                    "genre", "target_audience")
 
-# 导出阶段产出的文件。08 档案和 06 底图不列：它们在更早的阶段就生成了
+# 导出阶段产出的文件。08 档案和 06/12 底图不列：档案在更早的阶段就生成了，
+# 底图是出图的中间产物，画不出来时会退回纯排版，不该因为缺它就判定交付不全
 DELIVERABLES = ("01_English_Manuscript.docx", "02_Publishing_Copy.docx",
                 "03_Publishing_Copy.txt", "04_Internal_Synopsis.docx",
                 "05_Ebook_Cover.png", "07_Manuscript.epub",
-                "09_Image_Prompts.txt", "10_Quality_Check_Report.md")
+                "09_Image_Prompts.txt", "10_Quality_Check_Report.md",
+                "12_Promotional_Poster.png")
 META_CACHE = "11_Publishing_Metadata.json"
 
 
@@ -1062,6 +1081,14 @@ Please generate a comprehensive markdown Adaptation Bible containing:
 3. Worldbuilding Reference (Geography, social hierarchy, legal & political mechanics, economic equivalence, religion & social codes).
 4. Terminology Mapping Table (Ranks, institutions, currency, cultural customs).
 5. Timeline & Continuity Tracker (Chronology, key reveals, foreshadowing tracking).
+6. Historical Fact-Check Log — ONLY the facts the plot actually leans on: laws and
+   institutions that existed then, what a person of each character's standing was legally
+   and practically allowed to do, weapons/ranks/unit structure, how fast news and travel
+   moved, what medicine could and could not fix, and whether key objects and clothing
+   existed yet. One row each: claim -> verdict (verified / uncertain) -> what the story
+   does about it. Mark anything you are not sure of as UNCERTAIN instead of asserting it;
+   an invented town or regiment inside a real period is fine, silently bending a real
+   event to fit the plot is not.
 
 HARD REQUIREMENTS:
 - Every name must be fully native to {self.config.target_country}, {self.config.target_era}.
@@ -1112,6 +1139,13 @@ HARD REQUIREMENTS:
 - Day 3: First confrontation at the town assembly hall.
 - Day 7: Clara uncovers the tampered land deed in the study.
 - Day 14: Climax at the abandoned silver mill during the winter blizzard.
+
+## 6. Historical Fact-Check Log
+| Claim the plot leans on | Verdict | What the story does |
+| --- | --- | --- |
+| A county sheriff could hold a suspect without charge for days | Verified | Used as-is for the jailhouse scene |
+| Telegraph reached frontier towns by the 1880s | Verified | News of the land sale arrives in a day, not a week |
+| A woman could hold a land deed in her own name | UNCERTAIN — varies by state | Clara's deed is held in trust; plot function unchanged |
 """
         return response
 
@@ -1287,7 +1321,7 @@ Across the street, the yellow glow from the sheriff's office spilled onto the bo
                 f"第 {index} 章的英文正文里还有 {len(left)} 个中文字符"
                 f"（{''.join(left[:8])}…），这一段没改编")
         missed = [f"{zh}->{en}" for zh, en in chapter_names.items()
-                  if src.count(zh) >= 3 and en not in body]
+                  if src.count(zh) >= 3 and not name_was_used(en, body)]
         if missed:
             raise RuntimeError(
                 f"第 {index} 章有 {len(missed)} 个人名没按映射表来"
@@ -1458,6 +1492,7 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
         ("01_English_Manuscript.docx", "英文正文母稿"),
         ("03_Publishing_Copy.txt", "上架文案纯文本"),
         ("05_Ebook_Cover.png", "封面"),
+        ("12_Promotional_Poster.png", "宣传海报"),
         ("08_Adaptation_Bible.md", "改编档案"),
         ("11_Publishing_Metadata.json", "商品页元数据"),
     ]
@@ -2244,6 +2279,27 @@ KDP CATEGORIES (上传器按这几行逐级勾选，改的话必须是 KDP 分�
         )
         self.log("-> 05_Ebook_Cover.png (1600x2560 封面就绪"
                  + ("，AI 底图 + 排版文字)" if art_path.exists() else "，纯排版)"))
+
+        # 12_Promotional_Poster.png：宣传海报。底图用的 poster_prompt 一直都在生成，
+        # 但以前只写进 09 提示词文件、没人拿去画，交付清单里那一项始终是空的。
+        # 排版直接复用封面那套：海报同样竖版、同样压书名和 tagline，没必要再写一套；
+        # 用 2:3 而不是封面的 1:1.6，两者一眼能分清，不会互相冒充。
+        stage("生成海报")
+        poster_path = proj_dir / "12_Promotional_Poster.png"
+        poster_art = proj_dir / "12_Poster_Art_Raw.png"
+        if not poster_art.exists():
+            self.generate_cover_art(meta["poster_prompt"], poster_art)
+        kdp_formatter.create_cover_graphic(
+            title=self.config.book_title,
+            author=self.config.author_name,
+            subtitle="",
+            tagline=meta["tagline"],
+            output_path=poster_path,
+            width=1600, height=2400,
+            background=poster_art if poster_art.exists() else None
+        )
+        self.log("-> 12_Promotional_Poster.png (1600x2400 海报就绪"
+                 + ("，AI 底图 + 排版文字)" if poster_art.exists() else "，纯排版)"))
 
         # 07_Manuscript.epub：KDP 电子书首选格式，排版由我们说了算
         epub_path = proj_dir / "07_Manuscript.epub"
