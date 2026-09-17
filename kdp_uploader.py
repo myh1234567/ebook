@@ -100,10 +100,12 @@ class KDPMetadata:
                     picked.append(c)
             meta.categories = picked[:3]
 
-        # 检查正文文件与封面文件。EPUB 优先：KDP 对 EPUB 的转换结果最可控。
+        # 检查正文文件与封面文件。DOCX 优先：正文交给 KDP 自己转成 Kindle 格式，
+        # 不再自己传 EPUB —— 自己转的版式和 KDP 转出来的对不上，最终上架的是
+        # KDP 那一版，以自己那版为准等于在看一个不会发布的东西。
         # 一律存绝对路径：往 <input type=file> send_keys 相对路径，Chrome 会直接
         # 抛 "path is not absolute"，而调用方传相对目录是很容易发生的事。
-        for ms_name in ("07_Manuscript.epub", "01_English_Manuscript.docx"):
+        for ms_name in ("01_English_Manuscript.docx", "07_Manuscript.epub"):
             ms_cand = proj_dir / ms_name
             if ms_cand.exists():
                 meta.manuscript_path = str(ms_cand.resolve())
@@ -212,7 +214,7 @@ class KDPPreflightChecker:
                 issues.append(f"【警告】关键词槽位 {i} 长度超过 50 个字符（可能被截断）。")
 
         if not meta.manuscript_path or not Path(meta.manuscript_path).exists():
-            issues.append("【严重】未找到正文文件 (07_Manuscript.epub 或 01_English_Manuscript.docx)！")
+            issues.append("【严重】未找到正文文件 (01_English_Manuscript.docx 或 07_Manuscript.epub)！")
 
         if not meta.cover_path or not Path(meta.cover_path).exists():
             issues.append("【严重】未找到封面文件 (05_Ebook_Cover.png/jpg)！")
@@ -1342,13 +1344,12 @@ class KDPBrowserUploader:
 
         self._wait_processing_done()        # 还在转换就点提交，页面不会跳转
 
-        # 走一遍 Kindle 预览器再提交
-        self.log("打开 Kindle 预览器翻几页…")
-        self._run_previewer()
-
-        self.log("提交第 2 步…")
+        # 不再走 Kindle 预览器（_run_previewer 保留着，暂时不调）：预览由 KDP 在
+        # Save 之后自己生成，我们只要等它生成完。自己去点预览器既慢又多一处会崩的地方。
+        self.log("提交第 2 步（KDP 会在这一步生成预览，慢，耐心等）…")
         self.driver.execute_script("document.getElementById(arguments[0]).click()", self.F_SUBMIT)
-        self._wait_step_done("/pricing", "第 2 步")   # 跳转成功会自己打日志
+        # 超时给足：这一步不是网络慢，是 KDP 在转格式 + 生成预览，几分钟到十几分钟都正常
+        self._wait_step_done("/pricing", "第 2 步", timeout=1800)
 
         self.log("填写第 3 步（KDP Select / 版税 / 定价）…")
         self._fill_pricing(meta)

@@ -15,7 +15,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import List, Dict, Optional, Callable
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 import kdp_categories
 import kdp_formatter
@@ -37,13 +37,17 @@ MAX_BIBLE_CHARS = 30000
 # 后来改成 24000 上限，又把 3 万字的正常长章节误伤了 —— 截断这个做法本身就不对：
 # 它静默丢内容，成品里看不出少了什么。现在只在异常长的时候打个提醒，不动内容。
 BIG_CHAPTER_WARN = 30000   # 超过这个字数就提醒一句，多半是章节切分失效
-# 全书摘要（map-reduce）：改编档案必须建立在「读过全书」的基础上。
-# 原来只拿前 3 章的 1800 字就去定全书的人物表和术语表，后期人名必然漂。
-# 全文一次送不进去（某本 431 万字，差一个数量级），所以先分块摘要再汇总。
-SUMMARY_CHUNK_CHARS = 60000   # 每块原文多大。431 万字 ≈ 72 块
-MAX_SUMMARY_CHARS = 60000     # 汇总后的全书总结送进提示词的上限
-# 章节并行度。每章调用只依赖「全书总结 + 本章原文」，不依赖已改编的章节，
-# 所以并行产出和串行逐字相同，只是快 N 倍。实测单次调用约 16 秒且与推理档位无关。
+# 通读全书分两遍。第一遍分段读原文、逐章记事实；第二遍一次读完这些摘要，
+# 做所有需要全局视野的判断（分卷点、伏笔、时间跳跃、全书定名）。
+# 为什么必须分两遍：读第 1 段时模型不知道第 500 章会发生什么，这时候判断
+# 「这个冲突结束了没有」只能靠猜。事实可以边读边记，判断必须等读完。
+PASS1_SEGMENT_CHARS = 200000  # 第一遍每段原文多大。171 万字 ≈ 9 段，每段占窗口两成
+MAX_SUMMARY_CHARS = 60000     # 单卷梗概送进每章提示词的上限
+PREV_SUMMARY_CHAPTERS = 2     # 每章带前几章的摘要，用来接住上一章的结尾
+# 改编全程串行，代码里已经没有线程池了：第 N 章要带第 N-1 章的摘要，还要能把
+# 这一章新命名的实体立刻补进注册表给第 N+1 章用 —— 两件事都有顺序依赖，并行
+# 就是在制造名字分裂。并行只在「不同的书之间」做（多开终端跑 batch --only）。
+# chapter_workers 现在只剩一个用途：CLI 通道的熔断阈值随它放大（见 _call_llm）。
 DEFAULT_WORKERS = 20
 
 # 画封面底图要让 CLI 写文件，得放开工具权限 —— 而各家的开关完全不同，
@@ -61,7 +65,7 @@ COVER_TIMEOUT = 240
 
 # 分卷：一本长篇中文小说切成若干本英文书当系列发。
 # 第一本免费引流、后续付费，所以切点必须落在剧情的自然段落上，不能按字数平均分。
-VOL_MIN, VOL_MAX = 3, 8     # 封面是锦上添花，画不出来就用纯排版，不值得占用 30 分钟
+VOL_MIN, VOL_MAX = 3, 8
 
 # 书名还没定下来时的占位名。这些永远不能当真书名用：
 # 一旦当真，目录名会被回读成书名，下次重跑就不再去档案里取，坏书名就焊死了，
@@ -81,9 +85,6 @@ CHATTER_MARKERS = (
 )
 CHATTER_SCAN_CHARS = 400
 MIN_CHAPTER_CHARS = 400      # 正常一章几千字，几百字以下必有问题
-# 第一个章节标题之前的内容通常是书名/作者/来源站声明这类元信息，不是正文。
-# 真的楔子、序章会有像样的篇幅，所以按长度区分。
-FRONT_MATTER_MIN = 300
 
 
 def looks_like_chatter(text: str) -> str:
@@ -110,37 +111,15 @@ _EMPH_RE = re.compile(
 
 # ---- 人名一致性 ----
 # 老做法：档案里没有的名字让模型「自己编一个并保持一致」。这条指令不可能被满足 ——
-# 第 50 章和第 180 章跑在两个独立进程里，互相看不见对方编了什么，于是同一个配角
+# 第 50 章和第 180 章各写各的，互相看不见对方编了什么，于是同一个配角
 # 会有好几个英文名。实测一本书里顾潇变出了四五个名字。
-# 新做法：改编之前先把全书人名扫出来、一次性映射、落盘；每章只注入它自己用得到的
-# 那几条，并且禁止自创。抽不到的极少数走确定性兜底（同一个中文名在任何进程里
-# 算出来都一样），不需要任何跨进程协调。
-SURNAMES = (
-    "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜"
-    "戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳酆鲍史唐"
-    "费廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元卜顾孟平黄"
-    "和穆萧尹姚邵湛汪祁毛禹狄米贝明臧计伏成戴谈宋茅庞熊纪舒屈项祝董梁"
-    "杜阮蓝闵席季麻强贾路娄危江童颜郭梅盛林刁钟徐邱骆高夏蔡田樊胡凌霍"
-    "虞万支柯昝管卢莫柴瞿阎充慕连茹习宦艾鱼容向古易慎戈廖庾终暨居衡步"
-    "都耿满弘匡国文寇广禄阙东欧殳沃利蔚越夔隆师厉祖武符刘景詹束龙叶幸"
-    "司韶郜黎蓟薄印宿白怀蒲邰从鄂索咸籍赖卓蔺屠乔郁胥能苍双闻莘党翟谭"
-    "贡劳逄姬申扶堵冉宰郦雍却璩桑桂濮牛寿通边扈燕冀郏浦尚农温别庄晏柴"
-)
-COMPOUND_SURNAMES = ("欧阳", "司马", "上官", "诸葛", "东方", "独孤", "南宫",
-                     "慕容", "皇甫", "长孙", "宇文", "夏侯", "端木", "轩辕",
-                     "令狐", "公孙", "西门", "百里", "呼延", "赫连")
-# 抽取是宁滥勿缺：「王者」「马上」这类词也会被扫进来，交给模型在映射那一步剔掉。
-# 但极高频的明显非人名先挡掉，省得占满候选名额。
-NAME_STOPWORDS = {
-    "王者", "马上", "黄色", "白色", "金色", "自己", "方面", "时候", "问题",
-    "东西", "什么", "地方", "回去", "出来", "起来", "下来", "过来", "现在",
-    "这样", "那样", "可能", "应该", "已经", "还是", "但是", "因为", "所以",
-}
-NAME_MIN_COUNT = 3           # 出现不到 3 次的多半是误抽
-NAME_MAX_CANDIDATES = 400    # 送去映射的上限，按词频取前面的
+# 新做法：开跑之前先让模型逐块读全书认人 —— 一个人带着他的所有称呼算一条记录，
+# 合并成人之后一人发一个英文名，落盘定死；每章只注入它用得到的那几条，禁止自创。
+# 这里不用正则扫人名：正则只认「姓+1~2 字」，没有姓的称呼一个都扫不到，而且它
+# 产出的是字符串不是人 ——「周皇」和「姬止」是不是同一个人，读过原文才知道。
 
-# 兜底名字池。抽取漏掉的极少数走这里，靠哈希定位 —— 同一个中文名
-# 在任何 worker 里都算出同一个英文名，不需要协调。
+# 兜底名字池。两个实体撞上同一个英文名时，其中一个改用这里的名字。
+# 靠哈希定位，同一个中文名任何时候都算出同一个英文名，结果可复现。
 FALLBACK_FIRST = ("Adrian", "Beatrice", "Callum", "Delia", "Edmund", "Fiona",
                   "Gideon", "Harriet", "Isaac", "Jocelyn", "Killian", "Lorna",
                   "Marcus", "Nadia", "Oscar", "Petra", "Quentin", "Rosalind",
@@ -150,45 +129,6 @@ FALLBACK_LAST = ("Ashcroft", "Blackwood", "Carrow", "Danforth", "Ellsworth",
                  "Kingsley", "Lockhart", "Merrick", "Norwood", "Ophell",
                  "Prescott", "Quill", "Ransome", "Sterling", "Thorne")
 
-
-def extract_name_candidates(text: str, min_count: int = NAME_MIN_COUNT,
-                            limit: int = NAME_MAX_CANDIDATES) -> List[tuple]:
-    """从中文原文扫出人名候选，返回 [(名字, 出现次数)]，按次数降序。
-
-    扫的是全文而不是摘要 —— 摘要只提得到主角，几百个配角全在正文里。
-    纯正则，不花额度。
-    """
-    from collections import Counter
-    # 姓之后取 1 个字还是 2 个字，正则自己判断不了：贪婪匹配会把「顾潇走进」
-    # 吃成「顾潇走」，每句后面跟的字不同，于是同一个人被拆成一堆只出现两次的
-    # 变体，全被阈值滤掉。所以两种长度都当候选，让词频淘汰噪音 ——
-    # 真名反复出现，误抽的变体各自零散。
-    cjk = re.compile(r'[一-鿿]')
-    hits = Counter()
-    n = len(text)
-    for i, ch in enumerate(text):
-        base = 2 if text[i:i + 2] in COMPOUND_SURNAMES else (1 if ch in SURNAMES else 0)
-        if not base:
-            continue
-        for extra in (1, 2):
-            end = i + base + extra
-            if end > n:
-                break
-            cand = text[i:end]
-            if all(cjk.match(c) for c in cand[base:]):
-                hits[cand] += 1
-
-    picked = {n_: c for n_, c in hits.items()
-              if c >= min_count and n_ not in NAME_STOPWORDS}
-    # 「沈知」和「沈知意」次数一样时，长的才是全名，短的是它的前缀，丢掉
-    for name in list(picked):
-        longer = [o for o in picked
-                  if o != name and o.startswith(name) and picked[o] >= picked[name]]
-        if longer:
-            picked.pop(name, None)
-
-    out = sorted(picked.items(), key=lambda kv: -kv[1])
-    return out[:limit]
 
 
 def fallback_english_name(zh: str) -> str:
@@ -549,7 +489,7 @@ class NovelAdaptationEngine:
         self.bible = {}
         self.chapters_adapted = []
         self.metadata = {}
-        self._tier_lock = threading.Lock()   # 熔断状态会被并发的章节线程同时改
+        self._tier_lock = threading.Lock()   # 熔断状态可能被 GUI 线程同时读改
         # 按「命令+模型」记，不能只按命令：机器上只有一个 CLI 时，
         # 主备两级常常是同一个命令配不同模型（如 codex 两个模型互为兜底），
         # 只按命令记的话主通道一熔断，备用也被连坐跳过，等于没兜底。
@@ -876,175 +816,261 @@ target setting sells best on Amazon (name the comparable bestselling subgenre).
             best = "modern"
         return _FALLBACK_SETTINGS[best]
 
-    def summarize_book(self, raw_chapters: List[Dict[str, str]], proj_dir: Path,
-                       cancel_event=None, workers: int = DEFAULT_WORKERS) -> str:
-        """把全书分块读一遍，产出一份「读过全文」的总结，供改编档案使用。
+    def _segment_chapters(self, raw_chapters: List[Dict[str, str]]) -> List[Dict]:
+        """把全书按字符数切成连续段，段边界一律落在章边界上。
 
-        为什么要这一步：改编档案要给出人物映射表、术语对照表、伏笔追踪，这些
-        必须建立在全书之上。原来只拿前 3 章的 1800 字，配角、中段线索、结局
-        全都看不到，人名和术语到后期必然漂。
-
-        全文一次送不进去（431 万字，差一个数量级），所以 map-reduce：
-        分块摘要（互相独立，可并行）-> 汇总成一份总结。
-
-        每块摘要落盘到 _summaries/，重跑时直接复用 —— 这一步的成本不该付第二次。
+        切段只为「一次调用装得下」，不为理解剧情 —— 所以纯按长度切，不猜剧情节点。
+        剧情节点是第二遍读摘要时才判断的，那时候才看得见全书。
         """
-        sum_dir = proj_dir / "_summaries"
-        sum_dir.mkdir(parents=True, exist_ok=True)
-
-        # 按字数把章节攒成块，尽量不切断章节
-        chunks, cur, cur_len = [], [], 0
-        for ch in raw_chapters:
-            cur.append(ch)
-            cur_len += len(ch["content"])
-            if cur_len >= SUMMARY_CHUNK_CHARS:
-                chunks.append(cur)
-                cur, cur_len = [], 0
+        segs, cur, n = [], [], 0
+        for i, c in enumerate(raw_chapters, 1):
+            cur.append((i, c))
+            n += len(c["content"])
+            if n >= PASS1_SEGMENT_CHARS:
+                segs.append({"first": cur[0][0], "last": cur[-1][0],
+                             "items": cur, "chars": n})
+                cur, n = [], 0
         if cur:
-            chunks.append(cur)
+            segs.append({"first": cur[0][0], "last": cur[-1][0],
+                         "items": cur, "chars": n})
+        return segs
 
-        total_chars = sum(len(c["content"]) for c in raw_chapters)
-        self.log(f"全书 {len(raw_chapters)} 章 / {total_chars:,} 字，"
-                 f"分 {len(chunks)} 块做摘要（并发 {workers}）…")
+    def read_source_pass1(self, raw_chapters: List[Dict[str, str]], proj_dir: Path,
+                          cancel_event=None) -> Dict:
+        """第一遍：把全文分段读完，逐章记事实。返回 {章号: 摘要} 和实体清单。
 
-        sys_p = ("You are a story analyst. You read a slice of a Chinese web novel and "
-                 "extract the facts an adaptation team needs. Be precise and factual. "
-                 "Output English. Do not invent anything not present in the text.")
+        全书一次送不进去，所以分段 —— 但「分段读」和「没读全」是两回事：
+        每段都完整进过模型，产出落盘，九段跑完全书每个字都被读过一次。
+        跑完之后第二遍读的是这一遍的摘要（体量小一个数量级），那一次才是
+        真正的全局视野。
 
-        def one(i: int, group: List[Dict[str, str]]) -> str:
-            f = sum_dir / f"{i:04d}.md"
-            if f.exists():
-                return f.read_text("utf-8")
+        这一遍只许记事实（谁做了什么、谁和谁什么关系、出现了什么东西），
+        不许下判断。读第 1 段时模型不知道第 500 章会发生什么，这时候判断
+        「这个冲突结束了没有」只能靠猜，而猜错了后面看不出来。
+
+        串行，不并行：后一段带着前面累计的实体表去读，所以「周皇」出现在第 3 段、
+        「姬止」出现在第 1 段时，模型当场就能认出是同一个人。并行的话两段互相
+        看不见，只能等最后合并时靠描述去猜。
+        """
+        out_dir = proj_dir / "_pass1"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        segs = self._segment_chapters(raw_chapters)
+        total_ch = len(raw_chapters)
+        self.log(f"第一遍通读：{total_ch} 章 / {sum(s['chars'] for s in segs):,} 字符，"
+                 f"分 {len(segs)} 段串行读（每段约 {PASS1_SEGMENT_CHARS // 1000}K 字符）")
+
+        sys_p = ("You read a Chinese web novel and record facts for an adaptation team. "
+                 "You record what happens; you do not judge what it means. "
+                 "Output valid JSON only, no commentary.")
+
+        summaries: Dict[int, str] = {}
+        entities: List[Dict] = []
+
+        for k, seg in enumerate(segs, 1):
             if cancel_event and cancel_event.is_set():
-                return ""
-            text = "\n\n".join(f"【{c['title']}】\n{c['content']}" for c in group)
-            prompt = f"""Summarize this slice of the novel (chapters {group[0]['title']} ... {group[-1]['title']}).
+                break
+            f = out_dir / f"{k:04d}.json"
+            if f.exists():
+                try:
+                    got = json.loads(f.read_text("utf-8"))
+                    summaries.update({int(n): s for n, s in (got.get("chapters") or {}).items()})
+                    entities.extend(got.get("entities") or [])
+                    self.log(f"  · 第 {k}/{len(segs)} 段（第 {seg['first']}-{seg['last']} 章）已有，复用")
+                    continue
+                except Exception:
+                    pass
 
-Return markdown with these sections, listing ONLY what appears in this slice:
-- **Characters**: every named character, their role, relationships, and how they are addressed
-- **Terms**: setting-specific nouns (ranks, sects, items, places, institutions) with a short gloss
-- **Plot**: the causal chain of events, in order
-- **Reveals & Foreshadowing**: anything set up here or paid off here
+            text = "\n\n".join(f"【第 {i} 章 {c['title']}】\n{c['content']}"
+                               for i, c in seg["items"])
+            # 已经认出来的实体一起带过去，让模型把新出现的称呼挂到已有的人身上，
+            # 而不是当成新人再记一遍
+            known = ""
+            if entities:
+                known = "Entities already recorded earlier in this book (attach new "
+                known += "aliases to these instead of creating duplicates):\n"
+                known += "\n".join(f"  {'、'.join(e['aliases'][:6])} — {e.get('what','')}"
+                                   for e in entities[:400])
+            prompt = f"""Record the facts in chapters {seg['first']}-{seg['last']} of this novel.
+
+{known}
+
+Return JSON only:
+{{"chapters": {{"{seg['first']}": "这一章发生了什么：事件、谁做的、结果", "...": "..."}},
+  "entities": [{{"aliases": ["叫法1","叫法2"], "what": "他/它是什么，与谁什么关系",
+                "first_ch": {seg['first']}}}]}}
+
+Rules:
+- "chapters" must contain one entry for EVERY chapter number from {seg['first']} to
+  {seg['last']}, no gaps. 2-4 sentences each: what happened, who did it, what changed.
+  Name the concrete objects, documents, injuries and promises that show up — a later
+  step needs them to find what was planted here and paid off hundreds of chapters later.
+- "entities" is one entry per real thing: people, but also places, households, sects,
+  dynasties, named objects. Put EVERY way this text refers to it into "aliases".
+  The same person is called by full name, by surname plus a title, by a nickname.
+  The same house is called 李府, 李小姐的家, 李姥爷的家 — ONE place, three aliases.
+  A dynasty built out of a person's title is a SEPARATE entity, not that person.
+- Record facts only. Do NOT judge whether a conflict has ended, whether something is
+  foreshadowing, or where the story arcs break — you have not read the rest of the book
+  yet, and a later step decides all of that with the whole book in view.
 
 Text:
-\"\"\"{text[:SUMMARY_CHUNK_CHARS * 2]}\"\"\"
+\"\"\"{text}\"\"\"
 """
-            out = self._call_llm(prompt, sys_p)
-            if out:
-                f.write_text(out, "utf-8")
-            return out
+            self.log(f"  · 正在读第 {k}/{len(segs)} 段：第 {seg['first']}-{seg['last']} 章"
+                     f"（{seg['chars']:,} 字符）…")
+            raw = self._call_llm(prompt, sys_p) or ""
+            got = {}
+            m = re.search(r'\{.*\}', raw, re.DOTALL)
+            if m:
+                try:
+                    got = json.loads(m.group(0))
+                except Exception as exc:
+                    self.log(f"    ⚠️ 第 {k} 段解析失败（{exc}）")
+            chs = {int(n): str(s).strip()
+                   for n, s in (got.get("chapters") or {}).items()
+                   if str(n).isdigit() and str(s).strip()}
+            ents = [{"aliases": [str(a).strip() for a in (e.get("aliases") or [])
+                                 if str(a).strip()],
+                     "what": str(e.get("what", "")).strip()}
+                    for e in (got.get("entities") or []) if isinstance(e, dict)]
+            ents = [e for e in ents if e["aliases"]]
+            want = set(range(seg["first"], seg["last"] + 1))
+            missing = sorted(want - set(chs))
+            if missing:
+                self.log(f"    ⚠️ 这一段有 {len(missing)} 章没记到："
+                         f"{missing[:10]}{' …' if len(missing) > 10 else ''}")
+            if chs:
+                f.write_text(json.dumps({"chapters": {str(n): s for n, s in chs.items()},
+                                         "entities": ents},
+                                        ensure_ascii=False, indent=2), "utf-8")
+            summaries.update(chs)
+            entities.extend(ents)
+            self.log(f"    ✓ 记下 {len(chs)} 章、{len(ents)} 个实体"
+                     f"（累计 {len(summaries)}/{total_ch} 章）")
 
-        done = [f for f in sum_dir.glob("*.md")]
-        if done:
-            self.log(f"  · 已有 {len(done)} 块摘要，复用，只跑缺的。")
-
-        parts: Dict[int, str] = {}
-        if workers > 1 and len(chunks) > 1:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futs = {pool.submit(one, i, g): i for i, g in enumerate(chunks, 1)}
-                for k, fut in enumerate(as_completed(futs), 1):
-                    parts[futs[fut]] = fut.result()
-                    self.log(f"  摘要进度 {k}/{len(chunks)}")
+        gaps = [i for i in range(1, total_ch + 1) if i not in summaries]
+        if gaps:
+            self.log(f"⚠️ 全书还有 {len(gaps)} 章没有摘要，章号："
+                     f"{gaps[:20]}{' …' if len(gaps) > 20 else ''}")
         else:
-            for i, g in enumerate(chunks, 1):
-                parts[i] = one(i, g)
-                self.log(f"  摘要进度 {i}/{len(chunks)}")
+            self.log(f"第一遍完成：{len(summaries)}/{total_ch} 章全部记下，"
+                     f"{len(entities)} 条实体记录。")
+        return {"summaries": summaries, "entities": entities}
 
-        merged = "\n\n---\n\n".join(parts[i] for i in sorted(parts) if parts.get(i))
-        self.log(f"全书总结完成，{len(merged):,} 字符。")
-        return merged
+    def plan_story(self, pass1: Dict, total_ch: int, proj_dir: Path) -> Dict:
+        """第二遍：一次读完全部逐章摘要，做所有需要全局视野的判断。
 
-    def build_name_registry(self, raw_text: str, proj_dir: Path) -> Dict[str, str]:
-        """通读全文抽出所有人名，一次性映射成英文名，落盘当唯一事实来源。
+        输入是第一遍压缩出来的东西（823 章摘要约 165K token），一次装得下 ——
+        所以这一次模型手里是全书完整骨架，挑分卷点、判断哪个冲突真结束、
+        哪条线是伏笔，都有依据，不是拿局部猜。
 
-        为什么必须先做这一步：改编是几千章并行的，各章之间看不见对方。
-        名字如果留给各章现编，同一个配角会有好几个英文名。名字必须在开跑之前
-        就全部定死，每章只查表、不创造。
-
-        结果缓存到 12_Name_Registry.json，存在就永不重生成 —— 重生成会让
-        全书名字集体变样，和已经改好的章节对不上。
+        产出落盘 13_Story_Plan.json；里面的实体表另存一份 12_Name_Registry.json，
+        因为改编、导出、上架都按那个文件名读。
         """
-        cache = proj_dir / "12_Name_Registry.json"
+        cache = proj_dir / "13_Story_Plan.json"
         if cache.exists():
             try:
-                reg = json.loads(cache.read_text("utf-8"))
-                if reg:
-                    self.log(f"复用已有的人名映射表（{len(reg)} 个）")
-                    return reg
+                plan = json.loads(cache.read_text("utf-8"))
+                if plan.get("volumes"):
+                    self.log(f"复用已有的全书规划（{len(plan['volumes'])} 卷）")
+                    return plan
             except Exception:
                 pass
 
-        cands = extract_name_candidates(raw_text)
-        if not cands:
-            self.log("⚠️ 没从原文里扫到人名候选，本书改编将依赖档案里的映射表。")
+        summaries = (pass1 or {}).get("summaries") or {}
+        if not summaries:
+            # 缓存文件在但内容坏了，而这一轮又没跑第一遍 —— 硬报出来，
+            # 不能拿空骨架去规划全书：分卷和定名全错，而且会一路带到成书
+            self.log("⚠️ 没有逐章摘要可用（13_Story_Plan.json 坏了？删掉它重跑）")
             return {}
-        self.log(f"从全文扫出 {len(cands)} 个人名候选，正在一次性映射成英文名…")
+        listing = "\n".join(f"[{n}] {summaries[n]}" for n in sorted(summaries))
+        ents = "\n".join(f"{'、'.join(e['aliases'][:8])} — {e.get('what','')}"
+                         for e in pass1["entities"][:800])
+        self.log(f"第二遍：一次读完 {len(summaries)} 章摘要（{len(listing):,} 字符），"
+                 f"规划分卷、定名、找伏笔…")
 
-        listing = "\n".join(f"{n}\t{c}" for n, c in cands)
-        sys_p = ("You build character name glossaries for novel localization. "
-                 "Output valid JSON only, no commentary.")
-        user_p = f"""Below are Chinese string candidates extracted from a novel, with
-occurrence counts. Some are real person names; some are ordinary words that merely
-start with a surname character.
+        sys_p = ("You plan the English adaptation of a Chinese novel. You have the whole "
+                 "book in front of you. Output valid JSON only, no commentary.")
+        user_p = f"""Below is a per-chapter record of an entire {total_ch}-chapter Chinese
+novel, followed by every named entity recorded while reading it. You can see the whole
+book at once — every judgement below must use that.
 
-Return JSON grouped BY PERSON, not by string:
-  {{"people": [{{"name": "English Name", "zh": ["原名", "别称", ...]}}, ...]}}
+Return JSON:
+{{"synopsis": "the whole story in 400-600 words, English",
+  "volumes": [{{"from": 1, "to": 94, "title": "English volume title",
+                "arc": "what this volume covers and how it ends"}}],
+  "people": [{{"name": "English Name", "zh": ["称呼", "别称"], "kind": "person|place|org|thing"}}],
+  "foreshadow": [{{"setup_ch": 12, "payoff_ch": 480, "what": "戒指藏进抽屉 -> 成为关键证据"}}],
+  "time_jumps": [{{"at_ch": 301, "gap": "十年", "note": "主角从少年变成成年"}}]}}
 
-Rules:
-- ONE entry per human being. The same person is referred to many different ways in the
-  source — you decide which of these strings point at the same individual, put all of
-  them in that person's "zh" list, and give them a single English name. Several strings
-  sharing one English name is correct and expected: it is what stops one character from
-  ending up with several English names.
-- Sharing a surname does NOT make two strings the same person — relatives share surnames.
-  Same family: separate entries, different given names, one shared Western surname.
-  Merge only when the strings truly refer to the same individual.
-- Drop anything that is not a person's name. Do not include it in the output at all.
-- Names must be fully native to {self.config.target_country}, {self.config.target_era} —
-  the kind of name a person actually born there would carry.
-- NEVER romanize or adapt the Chinese name. No pinyin, no Chinese surname kept as an
-  English-looking word (Shen, Lin, Wang, Chen, Xu, Zhao...), no "sounds-similar" carryover,
-  no East-Asian-flavoured invented names. "沈知意" becomes something like "Nora Ashcroft",
-  never "Nora Shen". A reader must not be able to tell this story began in Chinese.
-- Give each person a distinct full name "First Last". Never reuse a full name.
-- Keep family relationships visible: characters sharing a Chinese surname must share
-  one Western surname (so 沈家 reads as one family).
-- Higher counts are main characters — give them the most memorable names.
+Rules for "volumes" — split into {VOL_MIN}-{VOL_MAX} volumes, each sold as its own book:
+- Cut where the STORY breaks, never at an even chapter count. Strongest signals first:
+  a time jump, a main goal finally won or lost, a move to a new region, the cast turning
+  over. A fight that ends but whose winner turns out to be someone's agent is NOT a break.
+- Every volume ends on "this chapter of their life is closed, but I want the next book".
+- Volumes must tile chapters 1..{total_ch} exactly: no gap, no overlap, in order.
+- Aim for 80,000-120,000 English words per volume (roughly 0.65 English words per Chinese
+  character), but a real story break beats hitting the word count.
 
-Candidates (name<TAB>count):
+Rules for "people" — this table is the whole book's naming law:
+- ONE entry per real thing. Merge every alias of the same person, place or household into
+  one entry. Records above may list the same thing several times under different aliases —
+  the descriptions tell you which are the same; merge them.
+- Sharing a surname does not make two entries one; relatives share surnames, and a
+  household is not its owner.
+- Names fully native to {self.config.target_country}, {self.config.target_era}. Never
+  romanize, no pinyin, no Chinese surname left as an English-looking word (Shen, Lin,
+  Wang), no "sounds similar" carryover. A reader must not be able to tell this story
+  began in Chinese.
+- Distinct entries never share a name. Same Chinese family -> same Western surname.
+
+Rules for "foreshadow" and "time_jumps": list only what the records actually show. These
+drive what the writing step is told about each chapter, so a wrong entry does real damage.
+
+Entities recorded while reading:
+{ents}
+
+Per-chapter record:
 {listing}
 """
         raw = self._call_llm(user_p, sys_p) or ""
-        people = []
+        plan = {}
         m = re.search(r'\{.*\}', raw, re.DOTALL)
         if m:
             try:
-                got = json.loads(m.group(0))
-                rows = got.get("people") if isinstance(got, dict) else None
-                if not isinstance(rows, list):
-                    # 模型偶尔退回老的扁平格式 {原名: English}。认，但那样就没有
-                    # 别名分组，一个称呼算一个人。
-                    rows = [{"name": v, "zh": [k]} for k, v in (got or {}).items()]
-                for p in rows:
-                    en = str((p or {}).get("name", "")).strip()
-                    # 只留纯 ASCII 英文名，模型偶尔会拿中文名占位
-                    if not (en and en.isascii()
-                            and re.match(r'^[A-Za-z][\w\s\'.-]*$', en)):
-                        continue
-                    zhs = [str(z).strip() for z in (p.get("zh") or []) if str(z).strip()]
-                    if zhs:
-                        people.append({"name": en, "zh": zhs})
+                plan = json.loads(m.group(0))
             except Exception as exc:
-                self.log(f"⚠️ 映射表解析失败（{exc}），本次不使用注册表。")
-
-        if not people:
-            self.log("⚠️ 没能生成人名映射表，改编会退回档案里的表，名字可能不一致。")
+                self.log(f"⚠️ 全书规划解析失败（{exc}）")
+        if not plan.get("volumes") or not plan.get("people"):
+            self.log("⚠️ 模型没给出可用的分卷或名册，这一步失败了。")
             return {}
 
-        # 撞名检查：两个不同的人拿到同一个英文名，读者会以为是同一个人。
-        # 按「人」查，不是按称呼查 —— 同一个人的几种称呼本来就共用一个英文名，
-        # 那是对的；按称呼查会把它当成撞名拆开，正好制造要防的问题。
+        # 分卷必须严丝合缝盖满全书。缺一段就是整段章节没人认领，
+        # 到导出时才发现的话，前面几小时的改编已经按错的卷跑完了。
+        vols = sorted([v for v in plan["volumes"]
+                       if isinstance(v, dict) and v.get("from") and v.get("to")],
+                      key=lambda v: int(v["from"]))
+        fixed, nxt = [], 1
+        for v in vols:
+            a, b = int(v["from"]), int(v["to"])
+            a = max(a, nxt)
+            if b < a:
+                continue
+            fixed.append({**v, "from": a, "to": min(b, total_ch)})
+            nxt = min(b, total_ch) + 1
+        if fixed and nxt <= total_ch:
+            self.log(f"  · 分卷没盖到第 {nxt}-{total_ch} 章，并进最后一卷")
+            fixed[-1]["to"] = total_ch
+        plan["volumes"] = fixed
+
+        people = []
+        for p in plan["people"]:
+            en = str((p or {}).get("name", "")).strip()
+            zhs = [str(z).strip() for z in (p.get("zh") or []) if str(z).strip()]
+            if zhs and en and en.isascii() and re.match(r'^[A-Za-z][\w\s\'.-]*$', en):
+                people.append({"name": en, "zh": zhs, "kind": p.get("kind", "person")})
+        # 撞名按「实体」查，不按称呼查：同一个人的几种称呼共用一个英文名是对的，
+        # 按称呼查会把它当成撞名拆开，正好制造要防的问题。
         seen = {}
         for p in people:
             if p["name"] in seen:
@@ -1052,25 +1078,61 @@ Candidates (name<TAB>count):
                 self.log(f"  · {p['zh'][0]} 与 {seen[p['name']]} 撞名（{p['name']}），改用 {new}")
                 p["name"] = new
             seen[p["name"]] = p["zh"][0]
+        plan["people"] = people
 
-        # 落盘仍是扁平的 {称呼: 英文名}：各章查表、名字回验都按这个形状读，不用改
-        reg = {zh: p["name"] for p in people for zh in p["zh"]}
+        cache.write_text(json.dumps(plan, ensure_ascii=False, indent=2), "utf-8")
+        (proj_dir / "12_Name_Registry.json").write_text(
+            json.dumps({"people": people}, ensure_ascii=False, indent=2), "utf-8")
+        self.log(f"-> 13_Story_Plan.json：{len(plan['volumes'])} 卷、{len(people)} 个实体、"
+                 f"{len(plan.get('foreshadow') or [])} 条伏笔、"
+                 f"{len(plan.get('time_jumps') or [])} 处时间跳跃")
+        for v in plan["volumes"]:
+            self.log(f"     第 {v['from']:>3}-{v['to']:>3} 章  {v.get('title', '')}")
+        return plan
+    @staticmethod
+    def _persist_registry_additions(proj_dir: Path, registry: Dict[str, str]):
+        """把改编途中新增的称呼写回注册表，保持按人分组的存法。
 
-        merged = [p for p in people if len(p["zh"]) > 1]
-        if merged:
-            self.log(f"  · {len(merged)} 个人有多种称呼，已并到同一个英文名：")
-            for p in sorted(merged, key=lambda x: -len(x["zh"]))[:8]:
-                self.log(f"     {'、'.join(p['zh'][:6])} -> {p['name']}")
+        只增不改：已有实体的英文名一个字不动，新称呼挂到同名实体下，
+        剩下的才另起一条。改已有的名字会让前面写完的章节全部对不上。
+        """
+        path = proj_dir / "12_Name_Registry.json"
+        try:
+            data = json.loads(path.read_text("utf-8"))
+        except Exception:
+            data = {}
+        people = data.get("people") if isinstance(data, dict) else None
+        if not isinstance(people, list):
+            people = [{"name": v, "zh": [k]} for k, v in (data or {}).items()
+                      if isinstance(v, str)]
+        by_name = {}
+        for p in people:
+            by_name.setdefault(p.get("name"), p)
+        for zh, en in registry.items():
+            p = by_name.get(en)
+            if p is None:
+                p = {"name": en, "zh": []}
+                people.append(p)
+                by_name[en] = p
+            if zh not in p["zh"]:
+                p["zh"].append(zh)
+        path.write_text(json.dumps({"people": people}, ensure_ascii=False, indent=2),
+                        "utf-8")
 
-        cache.write_text(json.dumps(reg, ensure_ascii=False, indent=2), "utf-8")
-        self.log(f"-> 12_Name_Registry.json（{len(people)} 个人、"
-                 f"{len(reg)} 种称呼已定死，各章只查表不创造）")
-        # 主要角色打出来，扫一眼就知道名字换彻底了没有。这张表一旦定下来全书都用它，
-        # 有问题趁早发现，比几千章跑完再看成本低得多。
-        top = sorted(reg.items(), key=lambda kv: -len(kv[0]))[:12]
-        for zh, en in top:
-            self.log(f"     {zh} -> {en}")
-        return reg
+    @staticmethod
+    def _flatten_registry(data) -> Dict[str, str]:
+        """把落盘的注册表摊成各章要用的 {称呼: 英文名}。
+
+        新格式是按人存的 {"people": [{"name", "zh": [...]}]}；老项目里存的是
+        扁平的 {称呼: 英文名}，一并认 —— 已经跑到一半的书不该因为换了存法就
+        重新定名字。
+        """
+        if isinstance(data, dict) and isinstance(data.get("people"), list):
+            return {zh: p["name"] for p in data["people"]
+                    for zh in (p.get("zh") or []) if p.get("name")}
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if isinstance(v, str)}
+        return {}
 
     def generate_adaptation_bible(self, raw_chapters: List[Dict[str, str]],
                                   book_summary: str = "") -> str:
@@ -1235,7 +1297,10 @@ HARD REQUIREMENTS:
         return ""
 
     def adapt_chapter(self, index: int, raw_title: str, raw_content: str,
-                      bible_text: str, registry: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+                      bible_text: str, registry: Optional[Dict[str, str]] = None,
+                      prev_summaries: Optional[List[str]] = None,
+                      vol_brief: str = "",
+                      notes: Optional[List[str]] = None) -> Dict[str, str]:
         """将单个章节改编为纯正美式英语小说正文。
 
         送进去的是「全书总结（改编档案）+ 本章完整原文」。两者都不做常规截断 ——
@@ -1265,8 +1330,9 @@ HARD REQUIREMENTS:
             "appears there — use that exact English name, spelled exactly that way. "
             "Do NOT invent a name for anyone in the table, do NOT shorten or vary it, and "
             "never output a Chinese name or a pinyin transliteration (Han Li, Wang, Li Wei). "
-            "For the rare person not in the table, pick a name and use it for that person "
-            "only within this chapter.\n"
+            "If someone or somewhere in this chapter is NOT in the table, name them and "
+            "report them in the JSON block at the end — the next chapter gets your name "
+            "from there, so it is used consistently for the rest of the book.\n"
             "2. TERMS: Same for every setting-specific noun — ranks, sects, techniques, items, "
             "currency, honorifics. Use the Bible's term mapping. Never leave qi, dao, jianghu, "
             "senior/junior brother, or similar untranslated.\n"
@@ -1289,19 +1355,34 @@ HARD REQUIREMENTS:
             lock = "\n".join(f"  {zh}  ->  {en}" for zh, en in chapter_names.items())
             lock_block = (
                 f"NAME LOCK — every person appearing in this chapter, and the exact English\n"
-                f"name to use for them. This table is shared by all 2000+ chapters; it is the\n"
-                f"only thing keeping one character from having five different names.\n"
+                f"name to use for them. Every chapter of this book is written against this same\n"
+                f"table; it is the only thing keeping one character from having five\n"
+                f"different names across the book.\n"
                 f"{lock}\n")
         else:
             lock_block = ""
 
+        # 本卷梗概：让这一章知道自己在整本书的哪个位置、这一卷要走到哪儿
+        vol_block = f"\nTHIS VOLUME:\n{vol_brief[:MAX_SUMMARY_CHARS]}\n" if vol_brief else ""
+        # 前几章的摘要：衔接靠它。章节是串行跑的，所以这里拿到的一定是
+        # 刚写完那几章的实际内容，不是原文摘要 —— 接的是英文稿，不是中文。
+        if prev_summaries:
+            prev_block = ("\nWHAT JUST HAPPENED (the chapters immediately before this one,"
+                          " as you wrote them):\n"
+                          + "\n".join(f"  [{index - len(prev_summaries) + i}] {s}"
+                                      for i, s in enumerate(prev_summaries)) + "\n")
+        else:
+            prev_block = ""
+        # 本章的特殊指示：伏笔回收、时间跳跃、卷首卷末 —— 都是第二遍通读时判断出来的
+        notes_block = ("\nSPECIAL TO THIS CHAPTER:\n"
+                       + "\n".join(f"  - {n}" for n in notes) + "\n") if notes else ""
+
         user_prompt = f"""
 {lock_block}
 ADAPTATION BIBLE — this is binding, not background. Every place and term below
-MUST be used exactly as mapped. Chapters are written independently by different workers,
-so the Bible is the only thing keeping 2000+ chapters consistent with each other.
+MUST be used exactly as mapped.
 \"\"\"{bible_text[:MAX_BIBLE_CHARS]}\"\"\"
-
+{vol_block}{prev_block}{notes_block}
 Target setting: {self.config.target_country}, {self.config.target_era}
 Genre: {self.config.genre}
 
@@ -1310,10 +1391,21 @@ Chinese source, chapter {index} — title: {raw_title}
 
 Rewrite this chapter as American English fiction set in the target setting.
 Relocate it completely: names, places, ranks, customs, objects. Keep the plot identical.
-Before writing, check every proper noun against the Bible's mapping tables.
-Format:
-Heading: Chapter {index}: [Engaging English Chapter Title]
+Pick up exactly where the previous chapter left off — same voice, and the forms of address
+characters have reached by now (people who have grown close do not go back to surnames).
+Format — prose first, then the JSON block, nothing else:
+
+Chapter {index}: [Engaging English Chapter Title]
 [Full novel prose paragraphs with natural dialogue and rich scene description]
+
+```json
+{{"summary": "2-3 sentences: what happened in this chapter, in English. The next chapter
+              gets only this, so put in what it must not contradict.",
+  "new_entities": [{{"name": "English Name", "zh": ["原文里的叫法"], "kind": "person|place|org|thing"}}]}}
+```
+"new_entities": only things you had to name yourself because they were missing from the
+NAME LOCK table. Leave it empty when there were none. Never restate or rename an entry
+that is already in the table — those are fixed for the whole book.
 """
         response = self._call_llm(user_prompt, system_prompt)
         if not response:
@@ -1328,6 +1420,10 @@ He had not returned to this territory in seven long years—not since the war ha
 
 Across the street, the yellow glow from the sheriff's office spilled onto the boardwalk. A figure stood silhouetted against the frosted glass, motionless and watching. Christopher smiled mirthlessly, touching the rim of his Stetson. The game had already begun before he had even set down his carpetbag.
 """
+        # 先把尾部的 JSON 块摘出来再当正文处理 —— 不摘的话它会被当成正文存进缓存，
+        # 一路印进书里。摘不到不算失败：摘要和增补都是锦上添花，正文才是交付物。
+        meta_out, response = self._split_chapter_meta(response)
+
         # 提取标题与正文
         lines = response.strip().splitlines()
         first_line = lines[0].strip("# ").strip()
@@ -1355,7 +1451,34 @@ Across the street, the yellow glow from the sheriff's office spilled onto the bo
             raise RuntimeError(
                 f"第 {index} 章有 {len(missed)} 个人名没按映射表来"
                 f"（原文里反复出现，译稿里却找不到对应英文名）：{'、'.join(missed[:5])}")
-        return {"title": first_line or f"Chapter {index}", "content": body}
+        return {"title": first_line or f"Chapter {index}", "content": body,
+                "summary": meta_out.get("summary", ""),
+                "new_entities": meta_out.get("new_entities", [])}
+
+    @staticmethod
+    def _split_chapter_meta(response: str):
+        """把正文末尾那个 JSON 块切下来，返回 (解析出的 dict, 去掉块之后的正文)。
+
+        模型不一定每次都带围栏、也不一定放在最后，所以找最后一个 ```json 块；
+        找不到就当这次没给，正文原样返回 —— 摘要和增补缺了只是下一章少点上下文，
+        为此把整章判死不值得。
+        """
+        blocks = list(re.finditer(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL))
+        if not blocks:
+            return {}, response
+        m = blocks[-1]
+        try:
+            got = json.loads(m.group(1))
+        except Exception:
+            return {}, (response[:m.start()] + response[m.end():]).strip()
+        meta = {"summary": str(got.get("summary", "")).strip(), "new_entities": []}
+        for e in (got.get("new_entities") or []):
+            en = str((e or {}).get("name", "")).strip()
+            zhs = [str(z).strip() for z in (e.get("zh") or []) if str(z).strip()]
+            if zhs and en and en.isascii() and re.match(r'^[A-Za-z][\w\s\'.-]*$', en):
+                meta["new_entities"].append({"name": en, "zh": zhs,
+                                             "kind": e.get("kind", "person")})
+        return meta, (response[:m.start()] + response[m.end():]).strip()
 
     def generate_publishing_metadata(self, bible_text: str, adapted_sample: str) -> Dict:
         """生成三版简介、恰好6个关键词、分类和提示词。"""
@@ -1561,8 +1684,8 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
             issues.append(f"{len(zh)} 章的英文正文里还残留中文字符："
                           + "；".join(f"第 {i} 章 {n} 个" for i, n in zh[:5]))
 
-        # 4) 人名一致性。档案里没有的全名，多半是某个 worker 自己编的 ——
-        #    几千章并行、各编各的，同一个人会出现好几个英文名。
+        # 4) 人名一致性。注册表里没有的全名，是某一章自己起的 —— 正常情况下
+        #    它会被回写进注册表给后面用，回写漏了就会出现同一个人好几个名字。
         full_name = re.compile(r'\b([A-Z][a-z]{2,})\s+([A-Z][a-z]{2,})\b')
         seen = {}
         for i, c in enumerate(adapted, 1):
@@ -1765,116 +1888,6 @@ Return JSON with exactly these keys:
             "categories": self.metadata.get("categories") or [],
         }
 
-    def plan_volumes(self, chapters: List[Dict[str, str]], book_summary: str,
-                     proj_dir: Path) -> List[Dict]:
-        """按剧情把全书切成 3-8 卷，每卷当成独立的一本英文书上架。
-
-        切点要落在剧情的自然段落上（大战结束、境界突破、场景转移），不是按字数
-        平均分 —— 读者读完第一卷要有「告一段落但想看下去」的感觉，这直接影响
-        第一本免费、后续付费的转化。
-
-        结果缓存到 12_Volumes.json，重跑不用再花一次调用。
-        """
-        cache = proj_dir / "12_Volumes.json"
-        if cache.exists():
-            try:
-                vols = json.loads(cache.read_text("utf-8"))
-                if vols:
-                    self.log(f"复用已有的分卷方案（{len(vols)} 卷）")
-                    return vols
-            except Exception:
-                pass
-
-        total = len(chapters)
-        self.log(f"正在按剧情规划分卷（全书 {total} 章，目标 {VOL_MIN}-{VOL_MAX} 卷）…")
-
-        # 只给章节标题清单，不给正文——几千章的正文送不进去，标题足够定切点
-        titles = "\n".join(f"{i}. {c['title']}" for i, c in enumerate(chapters, 1))
-        sys_p = ("You are a series editor for Amazon Kindle. You split long web novels into "
-                 "sellable multi-book series. Output valid JSON only, no commentary.")
-        user_p = f"""Split this {total}-chapter novel into {VOL_MIN}-{VOL_MAX} volumes for release
-as a Kindle series (book 1 free, later books paid).
-
-Rules:
-- Cut on natural story breaks: an arc resolving, a power/rank breakthrough, a move to a
-  new region, a major reveal. NEVER split mid-arc just to even out length.
-- Volume 1 must end on a satisfying beat that still makes the reader want book 2.
-- Volumes may differ in length. Uneven is fine if the story demands it.
-- Cover every chapter: volume 1 starts at 1, the last ends at {total}, no gaps or overlaps.
-
-Whole-book summary:
-\"\"\"{book_summary[:MAX_SUMMARY_CHARS]}\"\"\"
-
-Chapter titles:
-\"\"\"{titles[:60000]}\"\"\"
-
-Return JSON, nothing else:
-{{"volumes": [
-  {{"n": 1, "start": 1, "end": 120,
-    "subtitle": "Short evocative volume name, 2-5 English words",
-    "arc": "One sentence: what this volume covers and why it ends here"}}
-]}}"""
-        # 模型调不通（额度用光、限流）不能让分卷整个泡汤 ——
-        # 章节都改编好了，退回按章数均分也比一本书都出不来强。
-        vols = []
-        try:
-            raw = self._call_llm(user_p, sys_p)
-            m = re.search(r'\{.*\}', raw, re.DOTALL)
-            if m:
-                vols = json.loads(m.group(0)).get("volumes", [])
-        except Exception as exc:
-            self.log(f"⚠️ 分卷规划调模型失败（{exc}），退回按章数均分。"
-                     f"额度恢复后删掉 12_Volumes.json 重跑可拿到按剧情的切分。")
-
-        vols = self._sanitize_volumes(vols, total)
-        cache.write_text(json.dumps(vols, ensure_ascii=False, indent=2), "utf-8")
-        for v in vols:
-            self.log(f"  第 {v['n']} 卷：第 {v['start']}-{v['end']} 章  《{v['subtitle']}》")
-        return vols
-
-    def _sanitize_volumes(self, vols: List[Dict], total: int) -> List[Dict]:
-        """把模型给的分卷方案修成一定能用的样子。
-
-        模型经常会漏章、重叠、或者给的卷数超范围。这些都不能直接信 ——
-        漏掉的章节会永远不出现在任何一本书里，而且不会有任何报错。
-        """
-        clean = []
-        for v in vols or []:
-            try:
-                s, e = int(v["start"]), int(v["end"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if 1 <= s <= e <= total:
-                clean.append({"start": s, "end": e,
-                              "subtitle": str(v.get("subtitle") or "").strip(),
-                              "arc": str(v.get("arc") or "").strip()})
-        clean.sort(key=lambda x: x["start"])
-
-        if not clean:
-            # 模型完全没给可用结果：按字数均分成 VOL_MIN 卷兜底
-            self.log(f"⚠️ 分卷方案不可用，退回按章数均分 {VOL_MIN} 卷。")
-            # 用 ceil 分，余数摊在最后一卷里 —— 用 floor 的话
-            # 2450 章分 3 卷会多出个只有 2 章的尾巴卷，那不成一本书。
-            k = VOL_MIN
-            step = -(-total // k)
-            clean = [{"start": i * step + 1, "end": min((i + 1) * step, total),
-                      "subtitle": "", "arc": ""} for i in range(k)]
-            clean = [v for v in clean if v["start"] <= total]
-
-        # 首尾对齐、消除重叠和空隙：一章都不能丢
-        clean[0]["start"] = 1
-        for a, b in zip(clean, clean[1:]):
-            if b["start"] != a["end"] + 1:
-                b["start"] = a["end"] + 1
-        clean = [v for v in clean if v["start"] <= v["end"]]
-        clean[-1]["end"] = total
-
-        for i, v in enumerate(clean, 1):
-            v["n"] = i
-            if not v["subtitle"]:
-                v["subtitle"] = f"Part {i}"
-        return clean
-
     def _find_own_project(self) -> Optional[Path]:
         """在输出目录里找属于这本书的项目目录（靠 .owner 标记）。
 
@@ -2012,31 +2025,42 @@ Return JSON, nothing else:
         # 2. 生成 Adaptation Bible（已有就直接用，省一次调用，也保证续跑时人名地名一致）
         stage("生成改编档案")
         bible_path = proj_dir / "08_Adaptation_Bible.md"
-        book_summary = ""
+        plan_path = proj_dir / "13_Story_Plan.json"
+        pass1 = None
+        # 第一遍通读。两个下游都要它（档案、全书规划），两个都缓存命中时才跳过 ——
+        # 它本身也有 _pass1/ 缓存，所以这里跳过省的是读缓存的时间，不是调用费。
+        if not (bible_path.exists() and bible_path.stat().st_size > 200
+                and plan_path.exists()):
+            stage("通读全书")
+            pass1 = self.read_source_pass1(chapters, proj_dir, cancel_event)
+            if cancel_event and cancel_event.is_set():
+                return proj_dir
+        book_summary = "\n".join(
+            f"[{n}] {s}" for n, s in sorted((pass1 or {}).get("summaries", {}).items()))
+
         if bible_path.exists() and bible_path.stat().st_size > 200:
             bible_md = bible_path.read_text("utf-8")
             self.log(f"复用已有的改编档案: {bible_path.name}（{len(bible_md)} 字符）")
-            # 档案是缓存命中的，这一轮没跑摘要 —— 但分卷要用全书总结，
-            # 从落盘的分块摘要拼回来，别为这个再花一遍调用
-            sm = sorted((proj_dir / "_summaries").glob("*.md"))
-            if sm:
-                book_summary = "\n\n---\n\n".join(p.read_text("utf-8") for p in sm)
         else:
-            # 先把全书读一遍再建档案。档案会被每一章引用，做对它收益乘以章数。
-            stage("通读全书")
-            workers = max(1, int(getattr(self.config, "chapter_workers", DEFAULT_WORKERS) or 1))
-            book_summary = self.summarize_book(chapters, proj_dir, cancel_event, workers)
-            if cancel_event and cancel_event.is_set():
-                return proj_dir
             stage("生成改编档案")
             bible_md = self.generate_adaptation_bible(chapters, book_summary)
             bible_path.write_text(bible_md, "utf-8")
             self.log(f"已生成并保存改编档案: {bible_path.name}")
 
-        # 人名映射表：必须在开跑之前把全书人名定死。几千章并行、各章看不见对方，
-        # 名字留给各章现编的话，同一个配角会有好几个英文名。
-        stage("建立人名映射表")
-        name_registry = self.build_name_registry(raw_text, proj_dir)
+        # 第二遍：一次读完全部逐章摘要，做所有要全局视野的判断 ——
+        # 分卷点、伏笔、时间跳跃、全书定名。缓存命中就直接用，不重跑。
+        stage("规划全书")
+        story_plan = self.plan_story(pass1 or {}, len(chapters), proj_dir)
+        name_registry = self._flatten_registry(
+            {"people": story_plan.get("people") or []})
+        if not name_registry:
+            # 规划失败就退回上一次落盘的表，别拿空表去跑几千章
+            try:
+                name_registry = self._flatten_registry(json.loads(
+                    (proj_dir / "12_Name_Registry.json").read_text("utf-8")))
+            except Exception:
+                name_registry = {}
+            self.log("⚠️ 全书规划没拿到名册，退回已落盘的映射表继续。")
 
         if progress_cb:
             progress_cb(0.2)
@@ -2079,9 +2103,10 @@ Return JSON, nothing else:
             lo, hi = chapter_range
             self.log(f"只补第 {lo}–{min(hi, total_ch)} 章，跑完不导出交付文件。")
 
-        # 已落盘的直接读，没跑的丢给线程池。
-        # 每章调用只依赖「改编档案 + 本章原文」，不依赖前面已改编的章节，
-        # 所以并行产出和串行逐字相同，只是快 N 倍。
+        # 已落盘的直接读，没跑的按章号顺序串行补。
+        # 串行不是为了省事，是两处顺序依赖决定的：第 N 章要带第 N-1 章的摘要才接得上，
+        # 这一章新命名的人物要立刻补进注册表给第 N+1 章用。并行两样都做不到 ——
+        # 两个 worker 同时遇到同一个新人物会各起一个名字，那正是名字分裂的成因。
         by_idx: Dict[int, dict] = {}
         todo = []
         for idx, ch in enumerate(chapters, 1):
@@ -2093,53 +2118,94 @@ Return JSON, nothing else:
             else:
                 todo.append((idx, ch))
 
-        workers = max(1, int(getattr(self.config, "chapter_workers", DEFAULT_WORKERS) or 1))
         if todo:
-            self.log(f"待改编 {len(todo)} 章，并发 {workers} 路。")
+            self.log(f"待改编 {len(todo)} 章，按章号串行补。")
 
         failed = []
+        vols = story_plan.get("volumes") or []
+        added = 0
 
-        def one(idx: int, ch: dict):
+        def brief_for(idx: int) -> str:
+            for v in vols:
+                if int(v.get("from", 0)) <= idx <= int(v.get("to", 0)):
+                    return (f"Book \"{v.get('title', '')}\" covers chapters "
+                            f"{v['from']}-{v['to']}. {v.get('arc', '')}")
+            return story_plan.get("synopsis", "")[:MAX_SUMMARY_CHARS]
+
+        def notes_for(idx: int) -> List[str]:
+            """这一章的特殊指示。全部来自第二遍通读时的全局判断，不是就地猜的。"""
+            out = []
+            for v in vols:
+                if idx == int(v.get("to", 0)):
+                    out.append("This is the LAST chapter of this book. Land it on a close "
+                               "that satisfies, while leaving the reader wanting the next one.")
+                if idx == int(v.get("from", 0)) and idx > 1:
+                    out.append("This OPENS a new book. Re-establish who and where we are "
+                               "without recapping — a reader may start here.")
+            for fs in (story_plan.get("foreshadow") or []):
+                if int(fs.get("setup_ch", 0) or 0) == idx:
+                    out.append(f"PLANT, do not explain: {fs.get('what', '')} — it pays off "
+                               f"in chapter {fs.get('payoff_ch')}. Put the concrete detail on "
+                               f"the page so it can be called back later.")
+                if int(fs.get("payoff_ch", 0) or 0) == idx:
+                    out.append(f"PAY OFF what was planted in chapter {fs.get('setup_ch')}: "
+                               f"{fs.get('what', '')}")
+            for tj in (story_plan.get("time_jumps") or []):
+                if int(tj.get("at_ch", 0) or 0) == idx:
+                    out.append(f"TIME JUMP of {tj.get('gap', '')} before this chapter. "
+                               f"{tj.get('note', '')} Ages, circumstances and the way people "
+                               f"speak to each other must all have moved on.")
+            return out
+
+        for idx, ch in todo:
             if cancel_event and cancel_event.is_set():
-                return idx, None
+                break
+            stage(f"改编第 {idx}/{total_ch} 章")
+            # 前几章的摘要：优先用这一轮刚写的，续跑时从缓存里读
+            prev = []
+            for j in range(idx - PREV_SUMMARY_CHAPTERS, idx):
+                if j < 1:
+                    continue
+                s = (by_idx.get(j) or {}).get("summary", "")
+                if not s:
+                    cp = ch_dir / f"{j:04d}.json"
+                    if cp.exists():
+                        try:
+                            s = json.loads(cp.read_text("utf-8")).get("summary", "")
+                        except Exception:
+                            s = ""
+                if s:
+                    prev.append(s)
             try:
-                adapted = self.adapt_chapter(idx, ch["title"], ch["content"],
-                                             bible_md, name_registry)
+                adapted = self.adapt_chapter(idx, ch["title"], ch["content"], bible_md,
+                                             name_registry, prev_summaries=prev,
+                                             vol_brief=brief_for(idx), notes=notes_for(idx))
             except Exception as exc:
-                # 一章挂掉不能把整批带崩：fut.result() 会把异常重新抛出，
-                # 而它在 with ThreadPoolExecutor 里，冒出去就是 2450 章一起完蛋。
-                # 这里记下来继续跑，缓存不写，下次重跑会自动重试这一章。
+                # 一章挂掉不能把整本带崩：记下来继续跑，缓存不写，下次重跑会重试这一章
                 failed.append((idx, str(exc)))
                 self.log(f"  ✗ 第 {idx} 章跳过：{exc}")
-                return idx, None
+                continue
+            # 这一章新命名的实体立刻补进表，第 idx+1 章就能用上。
+            # 只增不改：已经定下的名字一个字都不动，否则前面写完的章节全部对不上。
+            for e in adapted.get("new_entities") or []:
+                fresh = [z for z in e["zh"] if z not in name_registry]
+                if not fresh:
+                    continue
+                for z in fresh:
+                    name_registry[z] = e["name"]
+                added += len(fresh)
+                self.log(f"     + 第 {idx} 章新增：{'、'.join(fresh)} -> {e['name']}")
             # 立刻落盘：断在哪儿下次就从哪儿接着跑
             (ch_dir / f"{idx:04d}.json").write_text(
                 json.dumps(adapted, ensure_ascii=False), "utf-8")
-            return idx, adapted
+            by_idx[idx] = adapted
+            if progress_cb:
+                progress_cb(0.2 + 0.5 * (len(by_idx) / max(total_ch, 1)))
 
-        if todo and workers > 1:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futs = [pool.submit(one, i, c) for i, c in todo]
-                for k, fut in enumerate(as_completed(futs), 1):
-                    idx, adapted = fut.result()
-                    if adapted is None:
-                        continue
-                    by_idx[idx] = adapted
-                    # 并发下完成顺序是乱的，进度按完成数算，不按章号
-                    stage(f"改编中 {k}/{len(todo)} 章（并发 {workers}）")
-                    if progress_cb:
-                        progress_cb(0.2 + 0.5 * (len(by_idx) / max(total_ch, 1)))
-        else:
-            for idx, ch in todo:
-                if cancel_event and cancel_event.is_set():
-                    break
-                stage(f"改编第 {idx}/{total_ch} 章")
-                _, adapted = one(idx, ch)
-                if adapted is not None:
-                    by_idx[idx] = adapted
-                if progress_cb:
-                    progress_cb(0.2 + 0.5 * (len(by_idx) / max(total_ch, 1)))
+        if added:
+            # 增补的条目要落盘，否则下次重跑又是从旧表开始，同一批人再命名一次
+            self._persist_registry_additions(proj_dir, name_registry)
+            self.log(f"改编途中新增 {added} 条称呼，已写回 12_Name_Registry.json")
 
         if cancel_event and cancel_event.is_set():
             self.log("收到中断信号，已完成的章节都存好了，下次点「开始改编」会接着跑。")
@@ -2378,8 +2444,14 @@ Author: {self.config.author_name}
         # 分卷：把全书切成若干本独立上架的英文书
         if getattr(self.config, "split_volumes", True) and not chapter_range:
             try:
-                stage("规划分卷")
-                vols = self.plan_volumes(chapters, book_summary, proj_dir)
+                # 分卷点用第二遍通读时定的那套，不再另切一次 —— 各章的卷末收束、
+                # 卷首重新立场景都是按这套写的，导出时换一套切，钩子就落在错的章上。
+                vols = [{"n": i, "start": int(v["from"]), "end": int(v["to"]),
+                         "subtitle": v.get("title") or f"Book {i}",
+                         "arc": v.get("arc", "")}
+                        for i, v in enumerate(story_plan.get("volumes") or [], 1)]
+                if not vols:
+                    raise RuntimeError("全书规划里没有分卷方案，跳过分卷（全书版已生成）")
                 stage("导出各卷物料")
                 made = self.export_volumes(vols, adapted_chapters, bible_md,
                                            proj_dir, proj_dir / "05_Ebook_Cover.png")
