@@ -230,7 +230,8 @@ def run_batch(folder: str,
               cancel=None,
               sa_path: str = "",
               gap_minutes: float = 0.0,
-              limit: int = 0) -> Dict[str, int]:
+              limit: int = 0,
+              only: str = "") -> Dict[str, int]:
     """把队列跑完。返回 {已完成, 跳过, 失败} 计数。
 
     gap_minutes：每本之间隔多久。批量往一个 KDP 账号上架是有风控风险的，
@@ -245,7 +246,31 @@ def run_batch(folder: str,
         log("队列是空的：这个 Drive 文件夹里没有 txt。")
         return {"done": 0, "skip": 0, "fail": 0}
 
+    # --only：点名跑某一本。认书名片段、Drive fileId，也认 _drive_cache 里
+    # 那种 <fileId>_<书名>.txt 的拼接名 —— 那是最顺手的复制来源，所以两个
+    # 方向都比一次（key 在书名里 / 书名在 key 里）。
+    if only:
+        key = only.strip().lower()
+        hit = [j for j in jobs if key in j.name.lower()
+               or j.name.lower() in key or j.file_id.lower() in key]
+        if len(hit) != 1:
+            # 宁可不跑也不猜：跑错一本是几小时 LLM 调用加一套 KDP 草稿。
+            if not hit:
+                log(f"队列里没有匹配「{only}」的书。先跑 `batch --list` 看确切名字。")
+            else:
+                log(f"「{only}」匹配到 {len(hit)} 本，说不准是哪本，写具体点：")
+                for j in hit:
+                    log(f"  · {j.name}")
+            return {"done": 0, "skip": 0, "fail": 0}
+        log(f"点名跑这本：{hit[0].name}（队列里另外 {len(jobs) - 1} 本不动）")
+        jobs = hit
+
     todo = [j for j in jobs if j.status != DONE]
+    if only and not todo:
+        # 点名了却被「已完成」挡掉，不说清楚的话看起来就像命令没生效
+        log(f"这本的状态是「{DONE}」，不会重跑。要重跑先打回待处理：\n"
+            f"  python3 -c \"import batch; batch.reset('{jobs[0].file_id}')\"")
+        return {"done": 0, "skip": 1, "fail": 0}
     log(f"队列共 {len(jobs)} 本，待处理 {len(todo)} 本"
         f"（已完成 {len(jobs) - len(todo)} 本会跳过）")
     if limit:
