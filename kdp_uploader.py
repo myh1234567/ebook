@@ -33,6 +33,8 @@ class KDPMetadata:
     price: float = 2.99
     royalty: str = "70%"
     marketplace: str = "amazon.com"
+    series_name: str = ""          # 系列名，就是书名去掉「: Book N」那截
+    series_number: int = 0         # 本书是系列第几本；0 表示不是系列
 
     @classmethod
     def load_from_project_dir(cls, proj_dir: Path) -> "KDPMetadata":
@@ -50,6 +52,15 @@ class KDPMetadata:
             m_sub = re.search(r'^Subtitle:[ \t]*(.+)', text, re.MULTILINE)
             if m_sub and m_sub.group(1).strip() != "N/A":
                 meta.subtitle = m_sub.group(1).strip()
+
+            # 系列：分卷导出时写的是 Series / Series Volume 两行。没写就从书名反推 ——
+            # 分卷的书名一律是「主标题: Book N」，去掉后半截就是系列名。
+            m_ser = re.search(r'^Series:[ \t]*(.+)', text, re.MULTILINE)
+            if m_ser and m_ser.group(1).strip() not in ("", "N/A"):
+                meta.series_name = m_ser.group(1).strip()
+            m_vol = re.search(r'^Series Volume:[ \t]*(\d+)', text, re.MULTILINE)
+            if m_vol:
+                meta.series_number = int(m_vol.group(1))
 
             m_author = re.search(r'^Author:[ \t]*(.+)', text, re.MULTILINE)
             if m_author:
@@ -116,6 +127,14 @@ class KDPMetadata:
             if cov_cand.exists():
                 meta.cover_path = str(cov_cand.resolve())
                 break
+
+        # 系列名兜底：书名去掉「: Book N」。分卷目录里没写 Series 行时靠这个。
+        if not meta.series_name:
+            m = re.match(r'^(.*?)[：:]\s*Book\s+(\d+)\s*$', meta.title, re.IGNORECASE)
+            if m:
+                meta.series_name = m.group(1).strip()
+                meta.series_number = meta.series_number or int(m.group(2))
+
 
         return meta
 
@@ -1286,6 +1305,156 @@ class KDPBrowserUploader:
     # 03_Publishing_Copy.txt 里没写分类时的兜底，免得整单卡在分类上
     DEFAULT_CATEGORIES = ["Romance > Romantic Comedy", "Romance > Contemporary"]
 
+    # 详情页 series-title-field 区块里三个按钮的 data-test-id（已在真实页面上核对）。
+    # 三个按钮一直都在 DOM 里，靠显隐切换状态：没进系列时只有 add 可见，
+    # 已进系列时是 edit + remove 可见、add 隐藏。所以判断状态要看可见性，
+    # 不能看元素在不在 —— 看在不在的话永远以为「还没进系列」。
+    B_SERIES_ADD = "add-series-details-button"
+    B_SERIES_EDIT = "edit-series-details-button"
+    B_SERIES_REMOVE = "remove-from-series-button"
+    # 建系列那条路上的按钮没有 data-test-id，只能按可见文字认
+    SERIES_STEPS = ("Create series", "Main content", "Go to series setup")
+    F_SERIES_TITLE = "data-series-title"   # 系列名输入框，maxlength=128
+
+    def _click_text(self, label: str, timeout: int = 20) -> bool:
+        """点页面上文字恰好是 label 的按钮/链接。等它出现，点不到就返回 False。
+
+        用完整匹配不用 contains：KDP 页面上「Create series」和「Create series page」
+        这类前缀重名的按钮是同时存在的，contains 会点错那个。
+        """
+        for _ in range(timeout):
+            hit = self.driver.execute_script("""
+                var want = arguments[0];
+                var els = document.querySelectorAll('button, a, span.a-button-text');
+                for (var i = 0; i < els.length; i++) {
+                    var e = els[i];
+                    if ((e.textContent || '').trim() !== want) continue;
+                    if (!e.offsetParent) continue;           // 不可见的跳过
+                    e.scrollIntoView({block: 'center'});
+                    e.click();
+                    return true;
+                }
+                return false;
+            """, label)
+            if hit:
+                self.log(f"  · 点了「{label}」")
+                return True
+            time.sleep(1)
+        return False
+
+    def _setup_series(self, meta: "KDPMetadata"):
+        """把这本书加进系列。系列不存在就当场建一个。
+
+        第一本要「Create series」把系列建出来；第二本起点「Select series」挑
+        已有的那个。挑不到就退回去建 —— 第一本上传失败过的话系列压根不存在，
+        这时候建出来才是对的，不然后面每一本都卡在这里。
+
+        整个流程失败都不抛错：系列只影响商品页的归类展示，为它把已经填好的
+        草稿整单废掉不划算。失败就记一笔，让你事后在网页上补。
+        """
+        if not meta.series_name:
+            return
+        self.log(f"把这本加进系列「{meta.series_name}」"
+                 f"（第 {meta.series_number or 1} 本）…")
+        try:
+            # 先看这本是不是已经在某个系列里了。重跑同一本书时很常见，
+            # 这时候 Add 按钮是隐藏的，硬点点不动，会白等一轮超时。
+            cur = self.driver.execute_script("""
+                var vis = function(id){
+                    var e = document.querySelector('[data-test-id="'+id+'"]');
+                    return !!(e && e.offsetParent);
+                };
+                var sec = document.getElementById('series-title-field');
+                return {inSeries: vis(arguments[1]),
+                        canAdd: vis(arguments[0]),
+                        text: sec ? (sec.innerText||'').trim().slice(0, 200) : ''};
+            """, self.B_SERIES_ADD, self.B_SERIES_EDIT) or {}
+            if cur.get("inSeries"):
+                shown = " / ".join(x for x in cur.get("text", "").splitlines() if x)[:120]
+                self.log(f"  · 这本已经在系列里了，不动它。页面显示：{shown}")
+                return
+            if not cur.get("canAdd"):
+                self.log("  ⚠️ 「Add to series」不可见，也没显示已在系列里，跳过系列设置")
+                return
+            self.driver.execute_script("""
+                var b = document.querySelector('[data-test-id="' + arguments[0] + '"]');
+                b.scrollIntoView({block: 'center'}); b.click();
+            """, self.B_SERIES_ADD)
+            self.log("  · 点了「Add to series」")
+            time.sleep(3)
+
+            if meta.series_number >= 2 and self._select_existing_series(meta.series_name):
+                return
+
+            for label in self.SERIES_STEPS:
+                if not self._click_text(label):
+                    self.log(f"  ⚠️ 没等到「{label}」按钮，系列设置停在这一步")
+                    return
+                time.sleep(3)
+
+            # 填系列名。注意用系列名不是书名：书名是「xxx: Book 1」，
+            # 拿它当系列名的话，第二卷会建出第二个系列，两本书永远凑不成一套。
+            ok = self.driver.execute_script("""
+                var el = document.getElementById(arguments[0]);
+                if (!el) return false;
+                el.scrollIntoView({block: 'center'});
+                el.focus(); el.value = '';
+                el.value = arguments[1];
+                el.dispatchEvent(new Event('input',  {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                return true;
+            """, self.F_SERIES_TITLE, meta.series_name)
+            if not ok:
+                self.log(f"  ⚠️ 没找到系列名输入框（#{self.F_SERIES_TITLE}）")
+                return
+            self.log(f"  · 系列名：{meta.series_name}")
+
+            # 系列表单上就这么点东西（已在真实页面上核对）：语言、系列名、
+            # 阅读顺序单选、以及一句「系列图片用前三本封面自动生成」的说明。
+            # 没有简介字段 —— 整页一个 textarea 都没有，所以这里没得填。
+            for label in ("Submit updates", "Save as draft"):
+                if self._click_text(label, timeout=5):
+                    time.sleep(4)
+                    break
+            else:
+                self.log("  ⚠️ 没找到系列的保存按钮，系列名可能没存上")
+        except Exception as exc:
+            self.log(f"  ⚠️ 系列设置没走完（{exc}），草稿其余部分不受影响，可事后在网页上补")
+
+    def _select_existing_series(self, name: str) -> bool:
+        """第二本起：点「Select series」，在列表里挑出已经建好的那个系列。
+
+        挑中返回 True；没找到返回 False，调用方会退回去走「建系列」那条路。
+
+        弹层里那份系列列表的 DOM 我没拿到，所以不写死结构：在可见元素里找
+        文字恰好等于系列名的那个来点。宁可认不出来退回去建，也不按「包含」
+        去匹配 —— 「Box Office Bluff」和「Box Office Bluff Origins」同时存在时，
+        包含匹配会把书挂到错的系列上，而那种错在商品页上很久才看得出来。
+        """
+        if not self._click_text("Select series", timeout=10):
+            self.log("  · 页面上没有「Select series」，改走新建系列")
+            return False
+        time.sleep(3)
+        if self._click_text(name, timeout=10):
+            self.log(f"  · 选中了已有的系列「{name}」")
+            # 弹层里通常还有一步确认，认不出来也不算失败：系列已经选上了
+            for label in ("Select", "Confirm", "Save", "Done"):
+                if self._click_text(label, timeout=2):
+                    break
+            return True
+        avail = self.driver.execute_script("""
+            var out = [], els = document.querySelectorAll('button, a, td, li, span');
+            for (var i = 0; i < els.length && out.length < 12; i++) {
+                var t = (els[i].textContent || '').trim();
+                if (t && t.length < 60 && els[i].offsetParent &&
+                    els[i].children.length === 0 && out.indexOf(t) < 0) out.push(t);
+            }
+            return out;
+        """) or []
+        self.log(f"  ⚠️ 列表里没找到「{name}」，改走新建系列。当前可见项：{avail[:8]}")
+        return False
+
+
     def upload_ebook(self, meta: KDPMetadata, cancel_event=None,
                      do_publish: bool = False):
         """建一本新的 Kindle 电子书草稿，填完第 1 步并传好正文与封面。
@@ -1320,6 +1489,9 @@ class KDPBrowserUploader:
         self.log("填写第 1 步（书名 / 作者 / 简介 / 关键词）…")
         self._fill_details(meta)
         self._pick_categories(meta.categories or self.DEFAULT_CATEGORIES)
+        # 系列在第 1 步这一页上，必须在提交之前设好 —— 提交之后页面就跳到
+        # 第 2 步了，「Add to series」入口不在那一页上
+        self._setup_series(meta)
 
         self.log("提交第 1 步…")
         self.driver.execute_script("document.getElementById(arguments[0]).click()", self.F_SUBMIT)
