@@ -68,10 +68,140 @@ VOL_MIN, VOL_MAX = 3, 8     # 封面是锦上添花，画不出来就用纯排�
 # 而且会印到分卷标题（「Untitled Adaptation: Book 1」）和封面上。
 PLACEHOLDER_TITLE = "Untitled Adaptation"
 
+# 模型有时不写正文，而是回过头来跟操作者说话：「Please provide the complete Chinese
+# text of Chapter 1...」「I cannot proceed without...」。这种回复以前会被原样当成
+# 章节正文存进缓存、进 epub、最后印在卖出去的书里。下面用来把它挡下来。
+# 只查开头一段：这些词组完全可能出现在正常章节的对白里，整篇搜会误伤。
+CHATTER_MARKERS = (
+    "please provide", "please supply", "please share", "please paste",
+    "could you provide", "the supplied excerpt", "the provided excerpt",
+    "the excerpt contains", "only metadata", "no chapter text",
+    "i need the", "i cannot", "i can't", "i'm unable", "i am unable",
+    "as an ai", "unable to proceed", "does not contain the chapter",
+)
+CHATTER_SCAN_CHARS = 400
+MIN_CHAPTER_CHARS = 400      # 正常一章几千字，几百字以下必有问题
+# 第一个章节标题之前的内容通常是书名/作者/来源站声明这类元信息，不是正文。
+# 真的楔子、序章会有像样的篇幅，所以按长度区分。
+FRONT_MATTER_MIN = 300
+
+
+def looks_like_chatter(text: str) -> str:
+    """判断一段「章节正文」其实是不是模型在跟你说话。
+
+    正常返回空串；有问题返回一句人话描述，直接拿去报错。
+    """
+    t = (text or "").strip()
+    if not t:
+        return "正文是空的"
+    if len(t) < MIN_CHAPTER_CHARS:
+        return f"正文只有 {len(t)} 字符，正常一章几千字"
+    head = t[:CHATTER_SCAN_CHARS].lower()
+    for m in CHATTER_MARKERS:
+        if m in head:
+            return f"开头出现「{m}」，是模型在跟你要原文，不是在写正文"
+    return ""
+
 
 # 书名可能被加粗、斜体或引号包着，模型每次挑的不一样，所以几种都要认
 _EMPH_RE = re.compile(
     r'\*\*(.+?)\*\*|\*(.+?)\*|__(.+?)__|_(.+?)_|“(.+?)”|"(.+?)"|《(.+?)》')
+
+
+# ---- 人名一致性 ----
+# 老做法：档案里没有的名字让模型「自己编一个并保持一致」。这条指令不可能被满足 ——
+# 第 50 章和第 180 章跑在两个独立进程里，互相看不见对方编了什么，于是同一个配角
+# 会有好几个英文名。实测一本书里顾潇变出了四五个名字。
+# 新做法：改编之前先把全书人名扫出来、一次性映射、落盘；每章只注入它自己用得到的
+# 那几条，并且禁止自创。抽不到的极少数走确定性兜底（同一个中文名在任何进程里
+# 算出来都一样），不需要任何跨进程协调。
+SURNAMES = (
+    "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜"
+    "戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳酆鲍史唐"
+    "费廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元卜顾孟平黄"
+    "和穆萧尹姚邵湛汪祁毛禹狄米贝明臧计伏成戴谈宋茅庞熊纪舒屈项祝董梁"
+    "杜阮蓝闵席季麻强贾路娄危江童颜郭梅盛林刁钟徐邱骆高夏蔡田樊胡凌霍"
+    "虞万支柯昝管卢莫柴瞿阎充慕连茹习宦艾鱼容向古易慎戈廖庾终暨居衡步"
+    "都耿满弘匡国文寇广禄阙东欧殳沃利蔚越夔隆师厉祖武符刘景詹束龙叶幸"
+    "司韶郜黎蓟薄印宿白怀蒲邰从鄂索咸籍赖卓蔺屠乔郁胥能苍双闻莘党翟谭"
+    "贡劳逄姬申扶堵冉宰郦雍却璩桑桂濮牛寿通边扈燕冀郏浦尚农温别庄晏柴"
+)
+COMPOUND_SURNAMES = ("欧阳", "司马", "上官", "诸葛", "东方", "独孤", "南宫",
+                     "慕容", "皇甫", "长孙", "宇文", "夏侯", "端木", "轩辕",
+                     "令狐", "公孙", "西门", "百里", "呼延", "赫连")
+# 抽取是宁滥勿缺：「王者」「马上」这类词也会被扫进来，交给模型在映射那一步剔掉。
+# 但极高频的明显非人名先挡掉，省得占满候选名额。
+NAME_STOPWORDS = {
+    "王者", "马上", "黄色", "白色", "金色", "自己", "方面", "时候", "问题",
+    "东西", "什么", "地方", "回去", "出来", "起来", "下来", "过来", "现在",
+    "这样", "那样", "可能", "应该", "已经", "还是", "但是", "因为", "所以",
+}
+NAME_MIN_COUNT = 3           # 出现不到 3 次的多半是误抽
+NAME_MAX_CANDIDATES = 400    # 送去映射的上限，按词频取前面的
+
+# 兜底名字池。抽取漏掉的极少数走这里，靠哈希定位 —— 同一个中文名
+# 在任何 worker 里都算出同一个英文名，不需要协调。
+FALLBACK_FIRST = ("Adrian", "Beatrice", "Callum", "Delia", "Edmund", "Fiona",
+                  "Gideon", "Harriet", "Isaac", "Jocelyn", "Killian", "Lorna",
+                  "Marcus", "Nadia", "Oscar", "Petra", "Quentin", "Rosalind",
+                  "Silas", "Tessa", "Ulric", "Vera", "Wendell", "Yvette")
+FALLBACK_LAST = ("Ashcroft", "Blackwood", "Carrow", "Danforth", "Ellsworth",
+                 "Fairbairn", "Grantham", "Hollis", "Ingram", "Jarvis",
+                 "Kingsley", "Lockhart", "Merrick", "Norwood", "Ophell",
+                 "Prescott", "Quill", "Ransome", "Sterling", "Thorne")
+
+
+def extract_name_candidates(text: str, min_count: int = NAME_MIN_COUNT,
+                            limit: int = NAME_MAX_CANDIDATES) -> List[tuple]:
+    """从中文原文扫出人名候选，返回 [(名字, 出现次数)]，按次数降序。
+
+    扫的是全文而不是摘要 —— 摘要只提得到主角，几百个配角全在正文里。
+    纯正则，不花额度。
+    """
+    from collections import Counter
+    # 姓之后取 1 个字还是 2 个字，正则自己判断不了：贪婪匹配会把「顾潇走进」
+    # 吃成「顾潇走」，每句后面跟的字不同，于是同一个人被拆成一堆只出现两次的
+    # 变体，全被阈值滤掉。所以两种长度都当候选，让词频淘汰噪音 ——
+    # 真名反复出现，误抽的变体各自零散。
+    cjk = re.compile(r'[一-鿿]')
+    hits = Counter()
+    n = len(text)
+    for i, ch in enumerate(text):
+        base = 2 if text[i:i + 2] in COMPOUND_SURNAMES else (1 if ch in SURNAMES else 0)
+        if not base:
+            continue
+        for extra in (1, 2):
+            end = i + base + extra
+            if end > n:
+                break
+            cand = text[i:end]
+            if all(cjk.match(c) for c in cand[base:]):
+                hits[cand] += 1
+
+    picked = {n_: c for n_, c in hits.items()
+              if c >= min_count and n_ not in NAME_STOPWORDS}
+    # 「沈知」和「沈知意」次数一样时，长的才是全名，短的是它的前缀，丢掉
+    for name in list(picked):
+        longer = [o for o in picked
+                  if o != name and o.startswith(name) and picked[o] >= picked[name]]
+        if longer:
+            picked.pop(name, None)
+
+    out = sorted(picked.items(), key=lambda kv: -kv[1])
+    return out[:limit]
+
+
+def fallback_english_name(zh: str) -> str:
+    """抽取漏掉的名字走这里。确定性：同一个中文名到哪都算出同一个英文名。"""
+    import hashlib
+    h = int(hashlib.md5(zh.encode("utf-8")).hexdigest(), 16)
+    return (f"{FALLBACK_FIRST[h % len(FALLBACK_FIRST)]} "
+            f"{FALLBACK_LAST[(h // len(FALLBACK_FIRST)) % len(FALLBACK_LAST)]}")
+
+
+def names_in_chapter(raw: str, registry: Dict[str, str]) -> Dict[str, str]:
+    """这一章的原文里出现了哪些已映射的名字。只注入这几条，提示词就不会被截断。"""
+    return {zh: en for zh, en in registry.items() if zh in raw}
 
 
 def is_placeholder_title(name: str) -> bool:
@@ -224,35 +354,79 @@ class ChapterSplitter:
     # 结果「第九百零一章」「第两千四百三十二章」这类标题匹配不上，被当成正文
     # 并进上一章 —— 实测某本 2245 章的书因此出现 72,251 字的「一章」，
     # 十几章被吞掉、章号整体错位。
+    # 番外/外传/序章/尾声这些也必须认。实测某本 422 章正文 + 8 篇番外的书，
+    # 番外标题匹配不上，被当成正文并进上一章 —— 成书里 8 篇番外全丢了，
+    # 而章数看起来还"对得上"，靠数字根本发现不了。
     CHAPTER_REGEX = re.compile(
         r'^\s*(第[0-9零一两二三四五六七八九十百千万亿]+[章回卷节篇]'
-        r'|Chapter\s+\d+|[Cc]hapter\s+[IVXLCDM]+|[0-9]{1,4}\s*[\.、])\s*(.*)$',
+        r'|番外[0-9零一两二三四五六七八九十百千万]*'
+        r'|外传[0-9零一两二三四五六七八九十百千万]*'
+        r'|[楔契]子|序[章言幕]?|尾声|终章|后记|完结感言'
+        r'|Chapter\s+\d+|[Cc]hapter\s+[IVXLCDM]+|[Ee]pilogue|[Pp]rologue'
+        r'|[0-9]{1,4}\s*[\.、])\s*(.*)$',
         re.MULTILINE
     )
 
+    # 下载站在正文前面加的信息头，实测长这样：
+    #     婴语满级后，丰腴保姆成九零团宠
+    #     分类：科幻
+    #     总章节：161
+    #     来源：笔尖中文(xbiquwk.com)
+    #     ==================================================
+    # 结尾那条分隔线是明确的界标，比按长度猜可靠得多。
+    FRONT_SEP = re.compile(r'^\s*[=\-—_*~#]{10,}\s*$')
+    FRONT_SCAN_LINES = 30        # 只在开头找，免得把正文里的分隔线当界标
+
+    @classmethod
+    def strip_front_matter(cls, text: str) -> str:
+        """切掉正文前的信息头（书名/分类/总章节/来源 + 分隔线）。
+
+        不切的话这段会被当成第 1 章送去改编 —— 模型拿到一堆元信息写不出正文，
+        回一句「Please provide the complete Chinese text of Chapter 1」，
+        那句话被当成章节正文存进缓存，一路印进了卖出去的书。每本书都中。
+        """
+        lines = text.splitlines()
+        for i, line in enumerate(lines[:cls.FRONT_SCAN_LINES]):
+            if not cls.FRONT_SEP.match(line):
+                continue
+            head = "\n".join(lines[:i])
+            # 分隔线之前要是已经有真章节标题，说明这条线是正文的一部分，不能切
+            if cls.CHAPTER_REGEX.search(head):
+                break
+            print(f"[切分] 去掉正文前的信息头 {i + 1} 行：{head.strip()[:36]!r}")
+            return "\n".join(lines[i + 1:])
+        return text
+
     @classmethod
     def split_text(cls, text: str) -> List[Dict[str, str]]:
+        text = cls.strip_front_matter(text)
         lines = text.splitlines()
         chapters = []
-        current_title = "Prologue / Chapter 1"
+        current_title = None          # None 表示还没遇到过任何章节标题
         current_lines = []
 
+        def close():
+            """收尾当前这一章。任何情况下都不丢内容。"""
+            content = "\n".join(current_lines).strip()
+            if current_title is not None:
+                chapters.append({"title": current_title, "content": content})
+            elif content:
+                # 第一个标题之前还有正文（楔子/序章）。信息头已经在
+                # strip_front_matter 里精确切掉了，所以这里剩下的一定是真内容，保留。
+                chapters.append({"title": "Prologue", "content": content})
+
         for line in lines:
-            match = cls.CHAPTER_REGEX.match(line)
-            if match and len(current_lines) > 5:
-                # 遇到新的章节标题且上一章已有内容
-                content = "\n".join(current_lines).strip()
-                if content:
-                    chapters.append({"title": current_title, "content": content})
+            # 原来这里有个 len(current_lines) > 5 的守卫，本意是防止正文里的
+            # 「123、」被误当成章节标题。但它会把短章节的标题吞进上一章，
+            # 信息头切掉之后第一章正好在首行，于是第一、二章直接被吃掉。
+            # 改成看标题行本身的长度：章节标题都很短，正文里的编号行通常很长。
+            if cls.CHAPTER_REGEX.match(line) and len(line.strip()) <= 40:
+                close()
                 current_title = line.strip()
                 current_lines = []
             else:
                 current_lines.append(line)
-
-        if current_lines:
-            content = "\n".join(current_lines).strip()
-            if content:
-                chapters.append({"title": current_title, "content": content})
+        close()
 
         # 如果没有识别出任何明确章节标题，则按字数（约2500字）切分
         if len(chapters) <= 1 and len(text) > 3500:
@@ -616,9 +790,12 @@ author. Judge on commercial grounds, not on literal similarity:
   narrative functional equivalence (power hierarchy, marriage and inheritance rules,
   law enforcement, money, honor and shame).
 - Prefer a setting with a large, active, keyword-rich readership on Amazon.
-- Keeping an East-Asian-inspired setting is allowed and sometimes better (e.g. cultivation
-  stories sell as romantasy / silkpunk fantasy); do not force a Western setting when it
-  would gut the story's appeal.
+- The target setting MUST be Western (Anglophone, European, or a secondary world built
+  from Western material — Regency Britain, Gilded Age America, Norse or Celtic fantasy,
+  1920s New York, a Ruritanian court...). Do NOT choose China, Japan, Korea, or any
+  East-Asian-inspired world, and do not keep wuxia/xianxia trappings under new labels.
+  The whole cultural frame is being replaced, not relabelled: people, place, institutions,
+  religion, food, dress and era all become Western.
 
 Return ONLY a JSON object with exactly these keys:
 "orig_era_region": original era and region, written in Chinese, one short phrase.
@@ -759,6 +936,94 @@ Text:
         self.log(f"全书总结完成，{len(merged):,} 字符。")
         return merged
 
+    def build_name_registry(self, raw_text: str, proj_dir: Path) -> Dict[str, str]:
+        """通读全文抽出所有人名，一次性映射成英文名，落盘当唯一事实来源。
+
+        为什么必须先做这一步：改编是几千章并行的，各章之间看不见对方。
+        名字如果留给各章现编，同一个配角会有好几个英文名。名字必须在开跑之前
+        就全部定死，每章只查表、不创造。
+
+        结果缓存到 12_Name_Registry.json，存在就永不重生成 —— 重生成会让
+        全书名字集体变样，和已经改好的章节对不上。
+        """
+        cache = proj_dir / "12_Name_Registry.json"
+        if cache.exists():
+            try:
+                reg = json.loads(cache.read_text("utf-8"))
+                if reg:
+                    self.log(f"复用已有的人名映射表（{len(reg)} 个）")
+                    return reg
+            except Exception:
+                pass
+
+        cands = extract_name_candidates(raw_text)
+        if not cands:
+            self.log("⚠️ 没从原文里扫到人名候选，本书改编将依赖档案里的映射表。")
+            return {}
+        self.log(f"从全文扫出 {len(cands)} 个人名候选，正在一次性映射成英文名…")
+
+        listing = "\n".join(f"{n}\t{c}" for n, c in cands)
+        sys_p = ("You build character name glossaries for novel localization. "
+                 "Output valid JSON only, no commentary.")
+        user_p = f"""Below are Chinese string candidates extracted from a novel, with
+occurrence counts. Some are real person names; some are ordinary words that merely
+start with a surname character.
+
+Return a JSON object mapping ONLY the real PERSON NAMES to new English names:
+  {{"原名": "English Name", ...}}
+
+Rules:
+- Drop anything that is not a person's name. Do not include it in the output at all.
+- Names must be fully native to {self.config.target_country}, {self.config.target_era} —
+  the kind of name a person actually born there would carry.
+- NEVER romanize or adapt the Chinese name. No pinyin, no Chinese surname kept as an
+  English-looking word (Shen, Lin, Wang, Chen, Xu, Zhao...), no "sounds-similar" carryover,
+  no East-Asian-flavoured invented names. "沈知意" becomes something like "Nora Ashcroft",
+  never "Nora Shen". A reader must not be able to tell this story began in Chinese.
+- Give each person a distinct full name "First Last". Never reuse a full name.
+- Keep family relationships visible: characters sharing a Chinese surname must share
+  one Western surname (so 沈家 reads as one family).
+- Higher counts are main characters — give them the most memorable names.
+
+Candidates (name<TAB>count):
+{listing}
+"""
+        raw = self._call_llm(user_p, sys_p) or ""
+        reg = {}
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        if m:
+            try:
+                got = json.loads(m.group(0))
+                # 只留「中文键 -> 纯 ASCII 英文名」的条目，模型偶尔会回中文名占位
+                for k, v in got.items():
+                    v = str(v).strip()
+                    if k and v and v.isascii() and re.match(r'^[A-Za-z][\w\s\'.-]*$', v):
+                        reg[k] = v
+            except Exception as exc:
+                self.log(f"⚠️ 映射表解析失败（{exc}），本次不使用注册表。")
+
+        if not reg:
+            self.log("⚠️ 没能生成人名映射表，改编会退回档案里的表，名字可能不一致。")
+            return {}
+
+        # 撞名检查：两个不同的人拿到同一个英文名，读者会以为是同一个人
+        seen = {}
+        for zh, en in list(reg.items()):
+            if en in seen:
+                reg[zh] = fallback_english_name(zh)
+                self.log(f"  · {zh} 与 {seen[en]} 撞名（{en}），改用 {reg[zh]}")
+            else:
+                seen[en] = zh
+
+        cache.write_text(json.dumps(reg, ensure_ascii=False, indent=2), "utf-8")
+        self.log(f"-> 12_Name_Registry.json（{len(reg)} 个人名已定死，各章只查表不创造）")
+        # 主要角色打出来，扫一眼就知道名字换彻底了没有。这张表一旦定下来全书都用它，
+        # 有问题趁早发现，比几千章跑完再看成本低得多。
+        top = sorted(reg.items(), key=lambda kv: -len(kv[0]))[:12]
+        for zh, en in top:
+            self.log(f"     {zh} -> {en}")
+        return reg
+
     def generate_adaptation_bible(self, raw_chapters: List[Dict[str, str]],
                                   book_summary: str = "") -> str:
         """生成全书改编档案 (Adaptation Bible)。"""
@@ -798,7 +1063,18 @@ Please generate a comprehensive markdown Adaptation Bible containing:
 4. Terminology Mapping Table (Ranks, institutions, currency, cultural customs).
 5. Timeline & Continuity Tracker (Chronology, key reveals, foreshadowing tracking).
 
-Ensure all names and institutions fit the target era authentic to {self.config.target_country} in {self.config.target_era}.
+HARD REQUIREMENTS:
+- Every name must be fully native to {self.config.target_country}, {self.config.target_era}.
+  No pinyin, no Chinese surname kept as an English-looking word (Shen, Lin, Wang, Chen...),
+  no East-Asian-flavoured invented names, no "sounds similar to the original" carryover.
+  A reader must not be able to tell this story began in Chinese.
+- Institutions must be REBUILT, not renamed. If the original turns on a procedure
+  (a succession, an election, an appointment, an inheritance, a trial), work out how that
+  procedure actually operates in {self.config.target_country} in {self.config.target_era} —
+  real offices, real timelines, real eligibility rules — and rewrite the mechanics to match.
+  Section 3 must contain a "Mechanics Translation" table: original procedure -> the target
+  society's real procedure -> what changes in the plot because of it. Renaming an emperor
+  a "president" while keeping the original's timing and powers is a failure.
 """
         response = self._call_llm(user_prompt, system_prompt)
         if not response:
@@ -895,7 +1171,8 @@ Ensure all names and institutions fit the target era authentic to {self.config.t
             return clean(m.group(1))
         return ""
 
-    def adapt_chapter(self, index: int, raw_title: str, raw_content: str, bible_text: str) -> Dict[str, str]:
+    def adapt_chapter(self, index: int, raw_title: str, raw_content: str,
+                      bible_text: str, registry: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """将单个章节改编为纯正美式英语小说正文。
 
         送进去的是「全书总结（改编档案）+ 本章完整原文」。两者都不做常规截断 ——
@@ -921,10 +1198,12 @@ Ensure all names and institutions fit the target era authentic to {self.config.t
             "a Chinese story into a new culture so completely that a reader would never "
             "guess it began in Chinese.\n\n"
             "ABSOLUTE RULES — violating any of these makes the chapter unusable:\n"
-            "1. NAMES: Use ONLY the English names from the Adaptation Bible's mapping tables. "
-            "Never output a Chinese name, a pinyin transliteration (Han Li, Wang, Li Wei), "
-            "or a Chinese place name. If a character or place is not in the Bible, invent an "
-            "English name that fits the target setting and use it consistently.\n"
+            "1. NAMES: The NAME LOCK table below is the law. Every person in this chapter "
+            "appears there — use that exact English name, spelled exactly that way. "
+            "Do NOT invent a name for anyone in the table, do NOT shorten or vary it, and "
+            "never output a Chinese name or a pinyin transliteration (Han Li, Wang, Li Wei). "
+            "For the rare person not in the table, pick a name and use it for that person "
+            "only within this chapter.\n"
             "2. TERMS: Same for every setting-specific noun — ranks, sects, techniques, items, "
             "currency, honorifics. Use the Bible's term mapping. Never leave qi, dao, jianghu, "
             "senior/junior brother, or similar untranslated.\n"
@@ -939,11 +1218,25 @@ Ensure all names and institutions fit the target era authentic to {self.config.t
             "7. OUTPUT: Chapter title and prose only. No preamble, no notes, no commentary."
         )
 
+        # 只注入本章出现的那几个名字。以前是把整份档案塞进来再截到 3 万字符 ——
+        # 映射表一长，后半截被静默切掉，那些角色的名字模型根本看不到，只能现编。
+        # 定向词表通常几百字符，既不会被截，也不给模型自由发挥的余地。
+        chapter_names = names_in_chapter(src, registry or {})
+        if chapter_names:
+            lock = "\n".join(f"  {zh}  ->  {en}" for zh, en in chapter_names.items())
+            lock_block = (
+                f"NAME LOCK — every person appearing in this chapter, and the exact English\n"
+                f"name to use for them. This table is shared by all 2000+ chapters; it is the\n"
+                f"only thing keeping one character from having five different names.\n"
+                f"{lock}\n")
+        else:
+            lock_block = ""
+
         user_prompt = f"""
-ADAPTATION BIBLE — this is binding, not background. Every name, place and term below
+{lock_block}
+ADAPTATION BIBLE — this is binding, not background. Every place and term below
 MUST be used exactly as mapped. Chapters are written independently by different workers,
 so the Bible is the only thing keeping 2000+ chapters consistent with each other.
-If you rename someone here, the series breaks.
 \"\"\"{bible_text[:MAX_BIBLE_CHARS]}\"\"\"
 
 Target setting: {self.config.target_country}, {self.config.target_era}
@@ -976,6 +1269,29 @@ Across the street, the yellow glow from the sheriff's office spilled onto the bo
         lines = response.strip().splitlines()
         first_line = lines[0].strip("# ").strip()
         body = "\n".join(lines[1:]).strip() if len(lines) > 1 else response
+
+        # 校验再落盘。不校验的话模型的「请把原文给我」会被当成章节正文存下来，
+        # 一路进缓存、进 epub、印到卖出去的书里 —— 而且因为有缓存，重跑也不会自愈。
+        # 这里抛错：调用方会记下这一章失败并继续跑别的，缓存不写，下次重跑会重试。
+        bad = looks_like_chatter(body)
+        if bad:
+            raise RuntimeError(
+                f"第 {index} 章的改编结果不是正文：{bad}。"
+                f"多半是送进去的原文本身没有正文 —— 原文开头：{raw_content[:60]!r}")
+
+        # 名字回验。光在提示词里嘱咐不够 —— 必须改完回头核对，不然又是「看起来
+        # 正常、实际上同一个人有五个名字」，而这种问题只能靠人工通读几十万词才发现。
+        left = re.findall(r'[一-鿿]', body)
+        if left:
+            raise RuntimeError(
+                f"第 {index} 章的英文正文里还有 {len(left)} 个中文字符"
+                f"（{''.join(left[:8])}…），这一段没改编")
+        missed = [f"{zh}->{en}" for zh, en in chapter_names.items()
+                  if src.count(zh) >= 3 and en not in body]
+        if missed:
+            raise RuntimeError(
+                f"第 {index} 章有 {len(missed)} 个人名没按映射表来"
+                f"（原文里反复出现，译稿里却找不到对应英文名）：{'、'.join(missed[:5])}")
         return {"title": first_line or f"Chapter {index}", "content": body}
 
     def generate_publishing_metadata(self, bible_text: str, adapted_sample: str) -> Dict:
@@ -1136,6 +1452,116 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
             return f"drive:{wid}"
         src = self.config.source_file
         return f"file:{Path(src).name}" if src else ""
+
+    # 交付物清单：(文件名, 说明)。报告里逐个查是否真的存在，不再写死 [x]。
+    QC_DELIVERABLES = [
+        ("01_English_Manuscript.docx", "英文正文母稿"),
+        ("03_Publishing_Copy.txt", "上架文案纯文本"),
+        ("05_Ebook_Cover.png", "封面"),
+        ("08_Adaptation_Bible.md", "改编档案"),
+        ("11_Publishing_Metadata.json", "商品页元数据"),
+    ]
+
+    def build_qc_report(self, chapters: List[Dict[str, str]],
+                        adapted: List[Dict[str, str]], bible_md: str,
+                        proj_dir: Path) -> str:
+        """真跑一遍检查再出报告。每条都有可复核的数字，不写任何没验证过的结论。"""
+        issues, notes = [], []
+
+        # 1) 章数。少一章是真丢内容，必须显眼。
+        n_src, n_out = len(chapters), len(adapted)
+        if n_out != n_src:
+            issues.append(f"章数对不上：原文切出 {n_src} 章，成稿只有 {n_out} 章，"
+                          f"差 {n_src - n_out} 章")
+        cached = {int(f.stem) for f in (proj_dir / "_chapters").glob("*.json")
+                  if f.stem.isdigit()}
+        missing = [i for i in range(1, n_src + 1) if i not in cached]
+        if missing:
+            issues.append(f"有 {len(missing)} 章没有改编结果，章号："
+                          f"{missing[:20]}{' …' if len(missing) > 20 else ''}")
+
+        # 2) 模型没写正文、反而在跟人说话的章节
+        chatter = [(i, looks_like_chatter(c.get("content", "")))
+                   for i, c in enumerate(adapted, 1)]
+        chatter = [(i, w) for i, w in chatter if w]
+        if chatter:
+            issues.append(f"{len(chatter)} 章不是正文（模型在跟你说话或正文过短）："
+                          + "；".join(f"第 {i} 章 {w}" for i, w in chatter[:5]))
+
+        # 3) 英文稿里残留中文 —— 说明那一段根本没改编
+        cjk = re.compile(r'[一-鿿]')
+        zh = [(i, len(cjk.findall(c.get("content", ""))))
+              for i, c in enumerate(adapted, 1)]
+        zh = [(i, n) for i, n in zh if n > 0]
+        if zh:
+            issues.append(f"{len(zh)} 章的英文正文里还残留中文字符："
+                          + "；".join(f"第 {i} 章 {n} 个" for i, n in zh[:5]))
+
+        # 4) 人名一致性。档案里没有的全名，多半是某个 worker 自己编的 ——
+        #    几千章并行、各编各的，同一个人会出现好几个英文名。
+        full_name = re.compile(r'\b([A-Z][a-z]{2,})\s+([A-Z][a-z]{2,})\b')
+        seen = {}
+        for i, c in enumerate(adapted, 1):
+            for m in full_name.finditer(c.get("content", "")):
+                seen.setdefault(m.group(0), set()).add(i)
+        unmapped = {k: v for k, v in seen.items() if k not in bible_md}
+        # 姓相同但名不同 —— 正是「同一个人换了名字」最典型的形态
+        by_last = {}
+        for name in seen:
+            by_last.setdefault(name.split()[-1], set()).add(name)
+        collide = {k: v for k, v in by_last.items() if len(v) > 1}
+        if unmapped:
+            top = sorted(unmapped.items(), key=lambda kv: -len(kv[1]))[:8]
+            issues.append(
+                f"{len(unmapped)} 个全名不在改编档案的映射表里（可能是各章自行编的）："
+                + "；".join(f"{k}（{len(v)} 章）" for k, v in top))
+        if collide:
+            top = sorted(collide.items(), key=lambda kv: -len(kv[1]))[:5]
+            issues.append("同姓不同名，需人工确认是不是同一个人被改了名："
+                          + "；".join(f"{k}: {'、'.join(sorted(v))}" for k, v in top))
+
+        # 5) 交付物是否真的存在
+        for fn, desc in self.QC_DELIVERABLES:
+            if not (proj_dir / fn).exists():
+                notes.append(f"缺少 {fn}（{desc}）")
+
+        verdict = ("❌ 未通过 —— 下列问题会进入成书，先修再上架"
+                   if issues else "✅ 自动检查未发现问题")
+        lines = [
+            "# 质检报告（自动检查，非人工通读）",
+            "",
+            f"- 书名：{self.config.book_title}",
+            f"- 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- 原文章节：{n_src}　成稿章节：{n_out}",
+            "",
+            f"## 结论：{verdict}",
+            "",
+        ]
+        if issues:
+            lines.append("## 发现的问题")
+            lines += [f"{i}. {t}" for i, t in enumerate(issues, 1)]
+            lines.append("")
+        if notes:
+            lines.append("## 提示")
+            lines += [f"- {t}" for t in notes]
+            lines.append("")
+        lines += [
+            "## 这份报告查了什么",
+            "- 章数是否与切分结果一致、有没有缺号",
+            "- 有没有「模型在跟你说话」而不是正文的章节",
+            "- 英文正文里有没有残留中文",
+            "- 有没有档案映射表之外的人名（各章自行编名的迹象）",
+            "- 同姓不同名（同一个人被改名的典型形态）",
+            "- 交付文件是否真的存在",
+            "",
+            "## 这份报告没查什么",
+            "- 情节是否忠于原著、有没有漏掉支线或番外",
+            "- 译文质量、人物口吻、文化迁移是否到位",
+            "- 政治/法律/制度等设定是否真的重构过，而不只是换了名称",
+            "",
+            "以上几项必须人工对照原著,自动检查给不出结论。",
+        ]
+        return "\n".join(lines)
 
     def export_volumes(self, vols: List[Dict], adapted: List[Dict[str, str]],
                        bible_md: str, proj_dir: Path, cover_src: Optional[Path]) -> List[Path]:
@@ -1543,6 +1969,11 @@ Return JSON, nothing else:
             bible_path.write_text(bible_md, "utf-8")
             self.log(f"已生成并保存改编档案: {bible_path.name}")
 
+        # 人名映射表：必须在开跑之前把全书人名定死。几千章并行、各章看不见对方，
+        # 名字留给各章现编的话，同一个配角会有好几个英文名。
+        stage("建立人名映射表")
+        name_registry = self.build_name_registry(raw_text, proj_dir)
+
         if progress_cb:
             progress_cb(0.2)
         if cancel_event and cancel_event.is_set():
@@ -1602,10 +2033,21 @@ Return JSON, nothing else:
         if todo:
             self.log(f"待改编 {len(todo)} 章，并发 {workers} 路。")
 
+        failed = []
+
         def one(idx: int, ch: dict):
             if cancel_event and cancel_event.is_set():
                 return idx, None
-            adapted = self.adapt_chapter(idx, ch["title"], ch["content"], bible_md)
+            try:
+                adapted = self.adapt_chapter(idx, ch["title"], ch["content"],
+                                             bible_md, name_registry)
+            except Exception as exc:
+                # 一章挂掉不能把整批带崩：fut.result() 会把异常重新抛出，
+                # 而它在 with ThreadPoolExecutor 里，冒出去就是 2450 章一起完蛋。
+                # 这里记下来继续跑，缓存不写，下次重跑会自动重试这一章。
+                failed.append((idx, str(exc)))
+                self.log(f"  ✗ 第 {idx} 章跳过：{exc}")
+                return idx, None
             # 立刻落盘：断在哪儿下次就从哪儿接着跑
             (ch_dir / f"{idx:04d}.json").write_text(
                 json.dumps(adapted, ensure_ascii=False), "utf-8")
@@ -1637,6 +2079,15 @@ Return JSON, nothing else:
 
         if cancel_event and cancel_event.is_set():
             self.log("收到中断信号，已完成的章节都存好了，下次点「开始改编」会接着跑。")
+
+        # 失败的章要显眼地报出来。以前模型的「请把原文给我」会被当成正文存下来，
+        # 一声不吭进了成书；现在挡下来了，但不报的话就变成默默缺章，同样看不见。
+        if failed:
+            self.log(f"⚠️ 有 {len(failed)} 章没改编成功，缓存没写，重跑会自动重试：")
+            for idx, why in failed[:10]:
+                self.log(f"     第 {idx} 章：{why}")
+            if len(failed) > 10:
+                self.log(f"     …另有 {len(failed) - 10} 章")
 
         # 完成顺序是乱的，最终必须按章号排回去
         adapted_chapters = [by_idx[i] for i in sorted(by_idx)]
@@ -1825,45 +2276,15 @@ Author: {self.config.author_name}
         prompts_txt.write_text(prompts_content, "utf-8")
         self.log("-> 09_Image_Prompts.txt (封面及宣传海报提示词就绪)")
 
-        # 10_Quality_Check_Report.md
+        # 10_Quality_Check_Report.md —— 真跑检查，不是套模板。
+        # 旧版把「100% Complete」和每个 [x] 都写死在模板里，从来没检查过任何东西。
+        # 实测某本书凭空多出第一章、丢了 8 篇番外、同一个人有四个英文名，
+        # 而报告照样写「100% 完整、连续性通过」—— 假报告比没报告更害人。
         qc_md = proj_dir / "10_Quality_Check_Report.md"
-        qc_content = f"""# Quality Check & Delivery Verification Report
-
-- **Project Name:** {self.config.book_title}
-- **Author / Pen Name:** {self.config.author_name}
-- **Original Setting:** {self.config.orig_era_region}
-- **Target Setting:** {self.config.target_country}, {self.config.target_era}
-- **Genre:** {self.config.genre}
-- **Timestamp:** {time.strftime('%Y-%m-%d %H:%M:%S')}
-
-## 1. Chapter Integrity Verification
-- Original Chapters Analyzed: {len(chapters)}
-- English Chapters Adapted: {len(adapted_chapters)}
-- Integrity Status: **100% Complete** (No summaries, no omitted scenes, full narrative causal continuity verified).
-
-## 2. Cultural & Historical Migration Checks
-- [x] Character names localized to era-appropriate Western conventions.
-- [x] Social institutions (courts, law enforcement, family hierarchy) adapted via narrative functional equivalence.
-- [x] Economic values preserved (relative purchasing power maintained).
-- [x] Pinyin, untranslated administrative ranks, and modern anachronisms purged.
-
-## 3. Language & Literary Quality (Anti-AI & Anti-Translationese)
-- Proofing Language: American English (`en-US`).
-- Narrative rhythm: Show, Don't Tell; visceral action and distinct character voices.
-- Stylistic purge: Eliminated passive translationese, symmetrical robotic phrasing, and meta commentary.
-
-## 4. Deliverables Checklist
-- [x] `01_English_Manuscript.docx` (Heading 1 styles, page breaks, first-line indent, title page)
-- [x] `02_Publishing_Copy.docx` (Full publishing metadata package)
-- [x] `03_Publishing_Copy.txt` (Easy-to-copy plaintext)
-- [x] `04_Internal_Synopsis.docx` (Complete internal synopsis with spoilers)
-- [x] `05_Ebook_Cover.png` (1600x2560 typography preview cover)
-- [x] `08_Adaptation_Bible.md` (Character ledger, worldbuilding, glossary, timeline)
-- [x] `09_Image_Prompts.txt` (Exact text-to-image prompts)
-- [x] `10_Quality_Check_Report.md` (This verification audit)
-"""
-        qc_md.write_text(qc_content, "utf-8")
-        self.log("-> 10_Quality_Check_Report.md (质检核验报告生成完成)")
+        qc_md.write_text(
+            self.build_qc_report(chapters, adapted_chapters, bible_md, proj_dir),
+            "utf-8")
+        self.log("-> 10_Quality_Check_Report.md (已跑真实检查，结论见报告顶部)")
 
         if progress_cb:
             progress_cb(1.0)
