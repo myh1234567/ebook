@@ -988,10 +988,18 @@ Text:
 occurrence counts. Some are real person names; some are ordinary words that merely
 start with a surname character.
 
-Return a JSON object mapping ONLY the real PERSON NAMES to new English names:
-  {{"原名": "English Name", ...}}
+Return JSON grouped BY PERSON, not by string:
+  {{"people": [{{"name": "English Name", "zh": ["原名", "别称", ...]}}, ...]}}
 
 Rules:
+- ONE entry per human being. The same person is referred to many different ways in the
+  source — you decide which of these strings point at the same individual, put all of
+  them in that person's "zh" list, and give them a single English name. Several strings
+  sharing one English name is correct and expected: it is what stops one character from
+  ending up with several English names.
+- Sharing a surname does NOT make two strings the same person — relatives share surnames.
+  Same family: separate entries, different given names, one shared Western surname.
+  Merge only when the strings truly refer to the same individual.
 - Drop anything that is not a person's name. Do not include it in the output at all.
 - Names must be fully native to {self.config.target_country}, {self.config.target_era} —
   the kind of name a person actually born there would carry.
@@ -1008,34 +1016,55 @@ Candidates (name<TAB>count):
 {listing}
 """
         raw = self._call_llm(user_p, sys_p) or ""
-        reg = {}
+        people = []
         m = re.search(r'\{.*\}', raw, re.DOTALL)
         if m:
             try:
                 got = json.loads(m.group(0))
-                # 只留「中文键 -> 纯 ASCII 英文名」的条目，模型偶尔会回中文名占位
-                for k, v in got.items():
-                    v = str(v).strip()
-                    if k and v and v.isascii() and re.match(r'^[A-Za-z][\w\s\'.-]*$', v):
-                        reg[k] = v
+                rows = got.get("people") if isinstance(got, dict) else None
+                if not isinstance(rows, list):
+                    # 模型偶尔退回老的扁平格式 {原名: English}。认，但那样就没有
+                    # 别名分组，一个称呼算一个人。
+                    rows = [{"name": v, "zh": [k]} for k, v in (got or {}).items()]
+                for p in rows:
+                    en = str((p or {}).get("name", "")).strip()
+                    # 只留纯 ASCII 英文名，模型偶尔会拿中文名占位
+                    if not (en and en.isascii()
+                            and re.match(r'^[A-Za-z][\w\s\'.-]*$', en)):
+                        continue
+                    zhs = [str(z).strip() for z in (p.get("zh") or []) if str(z).strip()]
+                    if zhs:
+                        people.append({"name": en, "zh": zhs})
             except Exception as exc:
                 self.log(f"⚠️ 映射表解析失败（{exc}），本次不使用注册表。")
 
-        if not reg:
+        if not people:
             self.log("⚠️ 没能生成人名映射表，改编会退回档案里的表，名字可能不一致。")
             return {}
 
-        # 撞名检查：两个不同的人拿到同一个英文名，读者会以为是同一个人
+        # 撞名检查：两个不同的人拿到同一个英文名，读者会以为是同一个人。
+        # 按「人」查，不是按称呼查 —— 同一个人的几种称呼本来就共用一个英文名，
+        # 那是对的；按称呼查会把它当成撞名拆开，正好制造要防的问题。
         seen = {}
-        for zh, en in list(reg.items()):
-            if en in seen:
-                reg[zh] = fallback_english_name(zh)
-                self.log(f"  · {zh} 与 {seen[en]} 撞名（{en}），改用 {reg[zh]}")
-            else:
-                seen[en] = zh
+        for p in people:
+            if p["name"] in seen:
+                new = fallback_english_name(p["zh"][0])
+                self.log(f"  · {p['zh'][0]} 与 {seen[p['name']]} 撞名（{p['name']}），改用 {new}")
+                p["name"] = new
+            seen[p["name"]] = p["zh"][0]
+
+        # 落盘仍是扁平的 {称呼: 英文名}：各章查表、名字回验都按这个形状读，不用改
+        reg = {zh: p["name"] for p in people for zh in p["zh"]}
+
+        merged = [p for p in people if len(p["zh"]) > 1]
+        if merged:
+            self.log(f"  · {len(merged)} 个人有多种称呼，已并到同一个英文名：")
+            for p in sorted(merged, key=lambda x: -len(x["zh"]))[:8]:
+                self.log(f"     {'、'.join(p['zh'][:6])} -> {p['name']}")
 
         cache.write_text(json.dumps(reg, ensure_ascii=False, indent=2), "utf-8")
-        self.log(f"-> 12_Name_Registry.json（{len(reg)} 个人名已定死，各章只查表不创造）")
+        self.log(f"-> 12_Name_Registry.json（{len(people)} 个人、"
+                 f"{len(reg)} 种称呼已定死，各章只查表不创造）")
         # 主要角色打出来，扫一眼就知道名字换彻底了没有。这张表一旦定下来全书都用它，
         # 有问题趁早发现，比几千章跑完再看成本低得多。
         top = sorted(reg.items(), key=lambda kv: -len(kv[0]))[:12]
