@@ -116,11 +116,20 @@ class KDPMetadata:
         # KDP 那一版，以自己那版为准等于在看一个不会发布的东西。
         # 一律存绝对路径：往 <input type=file> send_keys 相对路径，Chrome 会直接
         # 抛 "path is not absolute"，而调用方传相对目录是很容易发生的事。
-        for ms_name in ("01_English_Manuscript.docx", "07_Manuscript.epub"):
-            ms_cand = proj_dir / ms_name
-            if ms_cand.exists():
-                meta.manuscript_path = str(ms_cand.resolve())
-                break
+        # KPF 优先：Kindle Create 导出的 KPF 是已经排好版的成品，KDP 那边不再转换，
+        # 所见即所得。没有 KPF 才退回 DOCX（交给 KDP 自己转），最后才是 EPUB。
+        # KPF 的位置是 Kindle Create 定的：导出时它自己建一个文件夹装进去。
+        kpfs = sorted(proj_dir.glob("*/*.kpf")) + sorted(proj_dir.glob("*.kpf"))
+        if kpfs:
+            # 同名多份时取最新的：重新导出过就该用新的那份
+            newest = max(kpfs, key=lambda p: p.stat().st_mtime)
+            meta.manuscript_path = str(newest.resolve())
+        else:
+            for ms_name in ("01_English_Manuscript.docx", "07_Manuscript.epub"):
+                ms_cand = proj_dir / ms_name
+                if ms_cand.exists():
+                    meta.manuscript_path = str(ms_cand.resolve())
+                    break
 
         for cov_name in ("05_Ebook_Cover.png", "05_Ebook_Cover.jpg"):
             cov_cand = proj_dir / cov_name
@@ -1412,6 +1421,7 @@ class KDPBrowserUploader:
             # 系列表单上就这么点东西（已在真实页面上核对）：语言、系列名、
             # 阅读顺序单选、以及一句「系列图片用前三本封面自动生成」的说明。
             # 没有简介字段 —— 整页一个 textarea 都没有，所以这里没得填。
+            self._set_series_number(meta.series_number)
             for label in ("Submit updates", "Save as draft"):
                 if self._click_text(label, timeout=5):
                     time.sleep(4)
@@ -1420,6 +1430,48 @@ class KDPBrowserUploader:
                 self.log("  ⚠️ 没找到系列的保存按钮，系列名可能没存上")
         except Exception as exc:
             self.log(f"  ⚠️ 系列设置没走完（{exc}），草稿其余部分不受影响，可事后在网页上补")
+
+    def _set_series_number(self, n: int):
+        """填「这是系列第几本」。
+
+        8 卷加进一个系列，不填卷号的话商品页就没有阅读顺序，读者不知道先看哪本 ——
+        而系列的全部意义就是让人按顺序一本本买下去。
+
+        页面上 #data-series-number 是 type=hidden（详情页上核对过），真正可见的
+        输入控件在加入系列的那个流程里，我没能看到它的 DOM（手上那本书已经在系列里，
+        Add 按钮点不开）。所以这里两条都试：先找可见的输入框，再退回直接写隐藏字段，
+        并且把结果打出来 —— 第一次真跑就能从日志看出哪条有效。
+        """
+        if n < 1:
+            return
+        r = self.driver.execute_script("""
+            var want = String(arguments[0]);
+            var fire = function(el, v){
+                el.value = v;
+                el.dispatchEvent(new Event('input',  {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            };
+            // 1) 可见的输入框优先：它才是页面真正读的那个
+            var vis = Array.prototype.slice.call(
+                document.querySelectorAll('input')).filter(function(e){
+                    return e.offsetParent && /series.*(number|order|num)/i.test(
+                        (e.id||'') + ' ' + (e.name||''));
+                })[0];
+            if (vis) { vis.scrollIntoView({block:'center'}); fire(vis, want);
+                       return {how: 'visible', id: vis.id || vis.name}; }
+            // 2) 退回隐藏字段。可能不生效，所以要如实报出来
+            var h = document.getElementById('data-series-number');
+            if (h) { fire(h, want); return {how: 'hidden', id: h.id}; }
+            return {how: 'none'};
+        """, n) or {}
+        how = r.get("how")
+        if how == "visible":
+            self.log(f"  · 卷号 {n} 已填（{r.get('id')}）")
+        elif how == "hidden":
+            self.log(f"  · 卷号 {n} 写进了隐藏字段 {r.get('id')} —— "
+                     f"不一定被页面接受，传完在 KDP 上核对一下阅读顺序")
+        else:
+            self.log(f"  ⚠️ 没找到卷号输入框，第 {n} 本的顺序要你在网页上补")
 
     def _select_existing_series(self, name: str) -> bool:
         """第二本起：点「Select series」，在列表里挑出已经建好的那个系列。

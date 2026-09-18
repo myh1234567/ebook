@@ -316,6 +316,20 @@ def run_kdp_upload(args):
             mark = "✅" if not bad else "❌"
             done = "（传过了）" if (b / KDP_UPLOADED_MARK).exists() else ""
             print(f"   {mark} {b.name}{done} → {meta.title or '(书名为空)'}")
+            # 把真正会被上传的那两个文件打出来。正文优先级是 KPF > DOCX > EPUB，
+            # 光看「✅」看不出这次传的是哪一种，而这两者在 KDP 上的行为完全不同：
+            # KPF 是排好版的成品直接上架，DOCX 要 KDP 再转一次。
+            for label, path in (("正文", meta.manuscript_path),
+                                ("封面", meta.cover_path)):
+                if path:
+                    f = Path(path)
+                    rel = f.relative_to(b) if f.is_relative_to(b) else f
+                    print(f"        {label}：{rel}"
+                          f"（{f.stat().st_size / 1024 / 1024:.1f} MB）")
+                else:
+                    print(f"        {label}：缺")
+            if meta.series_name:
+                print(f"        系列：{meta.series_name} 第 {meta.series_number or 1} 本")
             for i in bad:
                 print(f"        {i}")
         print("\n（--dry-run：只看不传，没碰浏览器）")

@@ -107,6 +107,10 @@ class Settings:
     kdp_chrome_profile: str = ""
     kdp_auto_upload: bool = False    # 改编跑完自动开 Chrome 建草稿、传正文封面、填定价
     kdp_auto_publish: bool = False   # 连 Publish 也自动点——不可逆，默认关
+    # 用本地 Kindle Create 把母稿转成 KPF 再上传。KPF 是本地排好版的成品，
+    # KDP 不再二次转换，所见即所得；关掉就直接传 DOCX 让 KDP 自己转。
+    # 只在 macOS 且装了 Kindle Create 时生效，转换失败会退回 DOCX，不阻断上架。
+    kdp_make_kpf: bool = True
 
     @classmethod
     def load(cls) -> "Settings":

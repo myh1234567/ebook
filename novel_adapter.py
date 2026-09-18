@@ -8,6 +8,7 @@
 5. 生成标准交付文件 (DOCX/TXT/MD/PNG)。
 """
 import re
+import sys
 import json
 import subprocess
 import threading
@@ -1089,6 +1090,34 @@ Per-chapter record:
         for v in plan["volumes"]:
             self.log(f"     第 {v['from']:>3}-{v['to']:>3} 章  {v.get('title', '')}")
         return plan
+    def _make_kpf(self, docx: Path, proj_dir: Path):
+        """用 Kindle Create 把母稿转成 KPF，落在 proj_dir/KPF/ 下。
+
+        为什么值得做：KDP 也收 DOCX，但转换在它服务器上做，排版我们看不见也管不着。
+        KPF 是本地转好的成品，上传后不再二次转换。
+
+        失败只记一笔，不抛：上传那边没有 KPF 会自动退回 DOCX，为了一个可选的
+        排版升级把整本书的交付卡住不值得。
+
+        注意这一步会真的操作 Kindle Create 的界面，几分钟，期间别抢鼠标键盘。
+        """
+        if sys.platform != "darwin":
+            return
+        if not Path("/Applications/Kindle Create.app").exists():
+            self.log("  · 没装 Kindle Create，跳过 KPF；上传会用 DOCX")
+            return
+        have = sorted(proj_dir.glob("KPF/*.kpf"))
+        if have and have[0].stat().st_mtime >= docx.stat().st_mtime:
+            self.log(f"  · 已有 {have[0].name} 且不比母稿旧，跳过转换")
+            return
+        try:
+            import kindle_create
+            kindle_create.KindleCreate(log=self.log).convert(
+                docx=docx, out_dir=proj_dir,
+                title=self.config.book_title, author=self.config.author_name)
+        except Exception as exc:
+            self.log(f"  ⚠️ KPF 转换失败（{exc}），上传会退回 DOCX")
+
     @staticmethod
     def _persist_registry_additions(proj_dir: Path, registry: Dict[str, str]):
         """把改编途中新增的称呼写回注册表，保持按人分组的存法。
@@ -1651,7 +1680,8 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
 
     def build_qc_report(self, chapters: List[Dict[str, str]],
                         adapted: List[Dict[str, str]], bible_md: str,
-                        proj_dir: Path) -> str:
+                        proj_dir: Path,
+                        registry: Optional[Dict[str, str]] = None) -> str:
         """真跑一遍检查再出报告。每条都有可复核的数字，不写任何没验证过的结论。"""
         issues, notes = [], []
 
@@ -1684,28 +1714,34 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
             issues.append(f"{len(zh)} 章的英文正文里还残留中文字符："
                           + "；".join(f"第 {i} 章 {n} 个" for i, n in zh[:5]))
 
-        # 4) 人名一致性。注册表里没有的全名，是某一章自己起的 —— 正常情况下
-        #    它会被回写进注册表给后面用，回写漏了就会出现同一个人好几个名字。
-        full_name = re.compile(r'\b([A-Z][a-z]{2,})\s+([A-Z][a-z]{2,})\b')
-        seen = {}
-        for i, c in enumerate(adapted, 1):
-            for m in full_name.finditer(c.get("content", "")):
-                seen.setdefault(m.group(0), set()).add(i)
-        unmapped = {k: v for k, v in seen.items() if k not in bible_md}
-        # 姓相同但名不同 —— 正是「同一个人换了名字」最典型的形态
-        by_last = {}
-        for name in seen:
-            by_last.setdefault(name.split()[-1], set()).add(name)
-        collide = {k: v for k, v in by_last.items() if len(v) > 1}
-        if unmapped:
-            top = sorted(unmapped.items(), key=lambda kv: -len(kv[1]))[:8]
+        # 4) 人名一致性：注册表里没有的全名，是某一章自己起的名字。
+        #
+        # 只看注册表里那些【姓】的人。原来是把所有「大写词 + 大写词」都当全名，
+        # 实测一本书报出 5562 条，绝大多数是句首单词撞上人名：But Luke、When Luke、
+        # And Luke、The Hollywood…… 报告里堆着几千条误报，等于没有报告 ——
+        # 没人会去里面翻那几条真的。
+        #
+        # 现在只问一个问题：注册表里已知的姓，有没有配上注册表里没有的名？
+        # 这正是「同一个人被某一章改了名」的形态，也是唯一值得人工去核的信号。
+        known_full = {v for v in (registry or {}).values() if " " in v}
+        known_last = {v.rsplit(" ", 1)[-1] for v in known_full}
+        suspect = {}
+        if known_last:
+            pat = re.compile(
+                r'\b([A-Z][a-z]{2,})\s+(' + "|".join(
+                    sorted(map(re.escape, known_last), key=len, reverse=True)) + r')\b')
+            for i, c in enumerate(adapted, 1):
+                for m in pat.finditer(c.get("content", "")):
+                    if m.group(0) not in known_full:
+                        suspect.setdefault(m.group(0), set()).add(i)
+        if suspect:
+            top = sorted(suspect.items(), key=lambda kv: -len(kv[1]))[:8]
             issues.append(
-                f"{len(unmapped)} 个全名不在改编档案的映射表里（可能是各章自行编的）："
+                f"{len(suspect)} 个名字用了注册表里的姓、却配了表外的名"
+                f"（多半是某章自己改了名，也可能只是句首单词撞上姓）："
                 + "；".join(f"{k}（{len(v)} 章）" for k, v in top))
-        if collide:
-            top = sorted(collide.items(), key=lambda kv: -len(kv[1]))[:5]
-            issues.append("同姓不同名，需人工确认是不是同一个人被改了名："
-                          + "；".join(f"{k}: {'、'.join(sorted(v))}" for k, v in top))
+        elif not known_last:
+            notes.append("注册表里没有「名 + 姓」形式的条目，跳过人名一致性检查")
 
         # 5) 交付物是否真的存在
         for fn, desc in self.QC_DELIVERABLES:
@@ -1809,6 +1845,12 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
             kdp_formatter.format_manuscript_docx(
                 title=vtitle, subtitle=vsub, author=self.config.author_name,
                 chapters=part, output_path=vdir / "01_English_Manuscript.docx")
+            # 每卷单独转 KPF。分卷开着时上架的是各卷、不是全书版，所以 KPF 必须
+            # 落到卷目录里 —— 只在全书那一层转的话，split_volumes 默认开着，
+            # 全书 docx 压根不生成，KPF 一次都不会有，传上去的永远是 DOCX。
+            # 代价是每卷 3-4 分钟的 Kindle Create，8 卷就是半小时，且期间别抢鼠标。
+            if getattr(self.config, "kdp_make_kpf", False):
+                self._make_kpf(vdir / "01_English_Manuscript.docx", vdir)
             kdp_formatter.format_manuscript_epub(
                 title=vtitle, subtitle=vsub, author=self.config.author_name,
                 chapters=part, output_path=vdir / "07_Manuscript.epub",
@@ -2286,6 +2328,12 @@ Return JSON with exactly these keys:
             )
             self.log("-> 01_English_Manuscript.docx (母稿排版完成)")
 
+        # KPF：用本地 Kindle Create 把母稿再转一遍。KPF 是本地排好版的成品，
+        # 传上去 KDP 不再二次转换 —— 所见即所得。上传那边优先挑 KPF，没有才用 DOCX。
+        if getattr(self.config, "kdp_make_kpf", False) and manuscript_path.exists():
+            stage("生成 KPF")
+            self._make_kpf(manuscript_path, proj_dir)
+
         # 02_Publishing_Copy.docx & 03_Publishing_Copy.txt
         pub_docx = proj_dir / "02_Publishing_Copy.docx"
         kdp_formatter.format_publishing_copy_docx(
@@ -2433,7 +2481,8 @@ Author: {self.config.author_name}
         # 而报告照样写「100% 完整、连续性通过」—— 假报告比没报告更害人。
         qc_md = proj_dir / "10_Quality_Check_Report.md"
         qc_md.write_text(
-            self.build_qc_report(chapters, adapted_chapters, bible_md, proj_dir),
+            self.build_qc_report(chapters, adapted_chapters, bible_md, proj_dir,
+                                 name_registry),
             "utf-8")
         self.log("-> 10_Quality_Check_Report.md (已跑真实检查，结论见报告顶部)")
 

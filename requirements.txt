@@ -1,12 +1,37 @@
-edge-tts>=7.0
-python-docx>=1.1.0
-selenium>=4.20.0
-openai>=1.20.0
-Pillow>=10.0.0
+# 按功能分组。只跑小说改编 + KDP 上架的话，装「核心」那一段就够。
+# 装法：pip install -r requirements.txt
 
-# 声音克隆时才需要（会带 torch，约 3-4GB；不克隆就别装）
+# ---- 核心：小说改编 + KDP 上架 ----
+python-docx>=1.1.0          # 01_English_Manuscript.docx 母稿排版
+Pillow>=10.0.0              # 封面、海报合成（EPUB 用标准库 zipfile，不需要 ebooklib）
+selenium>=4.20.0            # KDP 网页上架。chromedriver 由 Selenium Manager 自动下载，不用手装
+openai>=1.20.0              # llm_provider=api 时的调用通道（CLI 通道不需要它）
+
+# Google Drive 批量取书。以前这两行被注释成「传 YouTube 才需要」，是错的：
+# gdrive.py 用 googleapiclient 列目录和下载，用 google.oauth2 认服务账号，
+# 也就是 `cli.py batch` 整条路都依赖它们。
+google-api-python-client>=2.100.0
+google-auth>=2.30.0
+
+# 用本地 Kindle Create 把母稿转成 KPF（novel_adapter 的 _make_kpf）。
+# 只在 macOS 有意义，所以带平台标记：别的系统上 pip 会直接跳过这一行。
+# 没装也不会崩 —— 转换那步会退回直接上传 DOCX。
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+
+# ---- 助眠视频（video 子命令）----
+edge-tts>=7.0               # 微软 TTS
+
+# ---- 下面这些按需再装 ----
+
+# 声音克隆（clone_tts.py）。会带 torch，约 3-4GB，不克隆就别装。
 # f5-tts
 
-# 上传 YouTube 时才需要（先不装也能生成视频）
-# google-api-python-client
+# 上传 YouTube（uploader.py）。只有走 OAuth 用户授权才需要，
+# Drive 那边用的是服务账号，不经过这个。
 # google-auth-oauthlib
+
+# ---- 不是 pip 装的外部依赖 ----
+# ffmpeg / ffprobe   合成视频用（macOS: brew install ffmpeg）
+# Kindle Create      生成 KPF 用，Amazon 官网下载，装到 /Applications
+#                    还要在「系统设置 → 隐私与安全性 → 辅助功能」里给终端授权，
+#                    否则界面自动化一步都动不了
