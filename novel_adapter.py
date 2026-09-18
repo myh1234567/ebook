@@ -1474,15 +1474,23 @@ Across the street, the yellow glow from the sheriff's office spilled onto the bo
             raise RuntimeError(
                 f"第 {index} 章的英文正文里还有 {len(left)} 个中文字符"
                 f"（{''.join(left[:8])}…），这一段没改编")
+        # 名字一致性不再用字符串匹配去审判整章。
+        #
+        # 原来的规则是「中文在原文出现 3 次以上，译稿里就必须出现对应英文名，
+        # 否则这一章作废」。它杀错的比杀对的多：注册表里只要混进一个像
+        # 「向」「金」「江」这样的条目，子串匹配就让它命中几乎每一章，
+        # 于是连着几十章被判死 —— 而那些译稿本身是好的。
+        #
+        # 靠加规则堵不住：今天是「向」，明天就是「王」「李」。判断「这个称呼指谁」
+        # 本来就要读懂上下文，那是模型的事：表已经作为 NAME LOCK 注入提示词，
+        # 表外的人模型会通过 new_entities 回报并命名，下一章就能用上。
+        # 这里只记一笔给质检报告，让人去看，不替人做决定。
         missed = [f"{zh}->{en}" for zh, en in chapter_names.items()
                   if src.count(zh) >= 3 and not name_was_used(en, body)]
-        if missed:
-            raise RuntimeError(
-                f"第 {index} 章有 {len(missed)} 个人名没按映射表来"
-                f"（原文里反复出现，译稿里却找不到对应英文名）：{'、'.join(missed[:5])}")
         return {"title": first_line or f"Chapter {index}", "content": body,
                 "summary": meta_out.get("summary", ""),
-                "new_entities": meta_out.get("new_entities", [])}
+                "new_entities": meta_out.get("new_entities", []),
+                "name_notes": missed}
 
     @staticmethod
     def _split_chapter_meta(response: str):
@@ -1742,6 +1750,19 @@ KDP CATEGORY LIST (the ONLY valid values for "categories"):
                 + "；".join(f"{k}（{len(v)} 章）" for k, v in top))
         elif not known_last:
             notes.append("注册表里没有「名 + 姓」形式的条目，跳过人名一致性检查")
+
+        # 各章自己记下的疑点：表里有这个称呼、原文反复出现，但译稿里没找到对应英文名。
+        # 这不一定是错 —— 可能是称呼在这一章指的是别的东西，也可能真漏了。
+        # 所以只在报告里列出来让人看，不在改编时判死整章（那样杀错的比杀对的多）。
+        flagged = {}
+        for i, c in enumerate(adapted, 1):
+            for n in (c.get("name_notes") or []):
+                flagged.setdefault(n, set()).add(i)
+        if flagged:
+            top = sorted(flagged.items(), key=lambda kv: -len(kv[1]))[:8]
+            notes.append(
+                f"{len(flagged)} 条映射在译稿里没找到对应英文名（值得抽查，不一定是错）："
+                + "；".join(f"{k}（{len(v)} 章）" for k, v in top))
 
         # 5) 交付物是否真的存在
         for fn, desc in self.QC_DELIVERABLES:
