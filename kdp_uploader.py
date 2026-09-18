@@ -637,24 +637,24 @@ class KDPBrowserUploader:
     # 封面那一段是折叠的，不展开下面的 file input 不生效。
     # 定位一律从「cover you already have」这段文字反查，不赌行的 class 名 ——
     # 之前写死 .a-accordion-row-a11y，class 一换就找不到，而且是静默找不到。
+    # 封面那两个选项是 Amazon 的 accordion，不是单选钮（真实页面上核对过）：
+    #   H5 > A.a-accordion-row.a-declarative > SPAN.a-heading-text "Upload a cover you already have"
+    # 要点的是那个 <a>，展开的处理器挂在它身上；点外层的 .a-accordion-row-a11y
+    # 包装器没有任何反应 —— 原来就是这么错的，日志报「已选」而页面还停在
+    # Use Cover Creator，最后传上去的是一本没有自有封面的书。
+    #
+    # 判据是 <a> 上的 aria-expanded：实测点击前 Cover Creator 是 "true"、
+    # 自有封面是 "false"，点完两者互换。
+    # 千万别拿那个 file input 当判据：它是 AjaxInput，永远 offsetParent 为空，
+    # 不管哪一栏展开都「不可见」，而它在 DOM 里又一直存在。
     JS_OWN_COVER = """
-    function ownCoverRow(){
-      var want='cover you already have', node=null;
-      document.querySelectorAll('span,label,h4,h5,a,div').forEach(function(e){
-        if(node) return;
-        // 只认最里层那个承载文字的节点，否则会一路匹配到 body
-        if((e.textContent||'').toLowerCase().indexOf(want)>-1
-           && e.querySelectorAll('*').length<6) node=e;
+    function ownCoverAnchor(){
+      var want='cover you already have', hit=null;
+      document.querySelectorAll('a.a-accordion-row').forEach(function(a){
+        if(hit) return;
+        if((a.textContent||'').toLowerCase().indexOf(want)>-1) hit=a;
       });
-      if(!node) return null;
-      return node.closest('.a-accordion-row-a11y') || node.closest('.a-accordion-row')
-          || node.closest('label') || node.closest('a') || node;
-    }
-    function ownCoverRadio(row){
-      if(!row) return null;
-      return row.querySelector('input[type=radio]')
-          || (row.closest('.a-accordion-row')
-              ? row.closest('.a-accordion-row').querySelector('input[type=radio]') : null);
+      return hit;
     }
     """
 
@@ -665,29 +665,30 @@ class KDPBrowserUploader:
         日志里却一路正常，最后在 Amazon 上看到的是一本没有封面的书。
         """
         r = self.driver.execute_script(self.JS_OWN_COVER + """
-            var row=ownCoverRow();
-            if(!row) return {ok:false};
-            row.scrollIntoView({block:'center'});
-            var radio=ownCoverRadio(row);
-            (radio||row).click();
-            return {ok:true, label:(row.textContent||'').trim().slice(0,60)};
+            var a = ownCoverAnchor();
+            if(!a) return {ok:false};
+            a.scrollIntoView({block:'center'});
+            if(a.getAttribute('aria-expanded') === 'true')
+                return {ok:true, already:true};
+            a.click();
+            return {ok:true, already:false};
         """) or {}
         if not r.get("ok"):
             raise RuntimeError("封面步骤：页面上找不到「upload a cover you already have」这一项")
-        self.log(f"  · 已选「{r.get('label', '')}」")
-
+        if r.get("already"):
+            self.log("  · 「上传自有封面」本来就是展开的")
+            return
         for _ in range(timeout):
             time.sleep(1)
-            st = self.driver.execute_script(self.JS_OWN_COVER + """
-                var row=ownCoverRow(), radio=ownCoverRadio(row);
-                var inp=document.getElementById(arguments[0]);
-                return {hasInput:!!inp, checked: radio ? !!radio.checked : null};
-            """, self.F_COVER) or {}
-            # 没有单选钮（纯折叠面板）时，上传框挂上来就算展开成功
-            if st.get("hasInput") and st.get("checked") is not False:
+            if self.driver.execute_script(self.JS_OWN_COVER + """
+                var a = ownCoverAnchor();
+                return !!a && a.getAttribute('aria-expanded') === 'true';
+            """):
+                self.log("  · 已切到「上传自有封面」")
                 return
         raise RuntimeError(
-            f"封面步骤：点了「上传自有封面」但没展开（上传框 #{self.F_COVER} 没出现）")
+            "封面步骤：点了「上传自有封面」但 aria-expanded 没变成 true，"
+            "页面可能还停在 Cover Creator")
 
     def _wait_categories_button(self, timeout: int = 90):
         """等「Choose categories」真正可点。
@@ -1365,6 +1366,8 @@ class KDPBrowserUploader:
             return
         self.log(f"把这本加进系列「{meta.series_name}」"
                  f"（第 {meta.series_number or 1} 本）…")
+        # 进流程之前记下详情页地址：建系列会跳走，跳走了得能找回来
+        back_url = self.driver.current_url
         try:
             # 先看这本是不是已经在某个系列里了。重跑同一本书时很常见，
             # 这时候 Add 按钮是隐藏的，硬点点不动，会白等一轮超时。
@@ -1425,11 +1428,167 @@ class KDPBrowserUploader:
             for label in ("Submit updates", "Save as draft"):
                 if self._click_text(label, timeout=5):
                     time.sleep(4)
+                    # 提交之后会弹「Your series has been saved」，必须点掉 ——
+                    # 不点它会一直盖在页面上，后面回详情页、点提交全被它挡住。
+                    self._dismiss_dialog("系列已保存")
                     break
             else:
                 self.log("  ⚠️ 没找到系列的保存按钮，系列名可能没存上")
         except Exception as exc:
             self.log(f"  ⚠️ 系列设置没走完（{exc}），草稿其余部分不受影响，可事后在网页上补")
+        finally:
+            # 「Go to series setup」会离开详情页，跳到 /en_US/series/<ID>?returnTo=…
+            # 这一步必须回来，否则后面点第 1 步的提交按钮时元素压根不存在，
+            # 报的是 "Cannot read properties of null (reading 'click')" ——
+            # 看起来像提交失败，实际是站错了页面。实测踩过。
+            self._back_to_title(back_url)
+
+    def _dismiss_dialog(self, what: str, timeout: int = 12) -> bool:
+        """把当前盖在页面上的确认弹窗点掉。
+
+        这个弹窗的按钮文案我没在真实页面上核对过（系列页要从详情页那条路才进得去，
+        绕一圈成本太高），所以不写死某个文字：在弹层范围内找可点的按钮，
+        并且把【实际点到的文字】打进日志 —— 下一次真跑就能拿到准确文案，
+        要收紧随时可以。找不到就按 Escape 兜一下。
+        """
+        for _ in range(timeout):
+            r = self.driver.execute_script("""
+                var box = document.querySelector(
+                    '.a-popover-wrapper, [role=dialog], .a-modal-scroller');
+                if (!box || !box.offsetParent) return null;
+                var pref = ['ok','okay','continue','close','done','got it','dismiss'];
+                var btns = Array.prototype.slice.call(
+                    box.querySelectorAll('button, input[type=submit], a.a-button-text'))
+                    .filter(function(b){ return b.offsetParent; });
+                if (!btns.length) return {found: false};
+                var pick = btns.filter(function(b){
+                    var t = (b.textContent || b.value || '').trim().toLowerCase();
+                    return pref.indexOf(t) > -1;
+                })[0] || btns[btns.length - 1];   // 认不出就点最后一个，通常是主按钮
+                var label = (pick.textContent || pick.value || '').trim();
+                pick.scrollIntoView({block: 'center'});
+                pick.click();
+                return {found: true, label: label.slice(0, 40),
+                        all: btns.map(function(b){
+                            return (b.textContent || b.value || '').trim().slice(0, 24);
+                        }).slice(0, 6)};
+            """)
+            if r and r.get("found"):
+                self.log(f"  · 点掉了「{what}」弹窗（按钮「{r.get('label')}」，"
+                         f"弹窗里有 {r.get('all')}）")
+                time.sleep(2)
+                return True
+            if r is None:
+                return True          # 压根没有弹窗，正常
+            time.sleep(1)
+        # 弹窗在但按钮认不出来，用 Escape 兜一下，并且如实报出来
+        try:
+            from selenium.webdriver.common.keys import Keys
+            self.driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+        self.log(f"  ⚠️ 「{what}」弹窗里没找到可点的按钮，按了 Escape")
+        return False
+
+    def _setup_series_on_draft(self, meta: "KDPMetadata"):
+        """草稿已建立之后，回详情页把系列设好，再回到第 2 步继续。
+
+        分三段：details 页做系列 -> 卷号在 details 页填（系列设置页上没有这个
+        字段，实测报「没找到卷号输入框」）-> 回 content 页继续传文件。
+
+        全程失败都不抛：系列只影响商品页归类，草稿本身已经建好了，
+        为它把整本的上架废掉不划算。
+        """
+        if not meta.series_name:
+            return
+        content_url = self.driver.current_url
+        details_url = re.sub(r"/content(\?|#|$)", r"/details\1", content_url)
+        if details_url == content_url:
+            self.log("  ⚠️ 认不出详情页地址，跳过系列设置")
+            return
+        try:
+            self.driver.get(details_url)
+            if not self.wait_ready(self.B_SERIES_ADD, 30):
+                self.log("  ⚠️ 详情页上没等到系列那一栏，跳过")
+                return
+            self._setup_series(meta)
+            # 卷号在详情页填：系列设置页上没有这个字段
+            self._set_series_number(meta.series_number)
+            self._click_submit()          # 存一下详情页，否则系列关联可能不落盘
+            time.sleep(6)
+        except Exception as exc:
+            self.log(f"  ⚠️ 系列设置没走完（{exc}），草稿其余部分不受影响")
+        finally:
+            # 必须回到第 2 步，后面要在那儿传正文和封面
+            try:
+                if "/content" not in self.driver.current_url:
+                    self.driver.get(content_url)
+                    time.sleep(5)
+            except Exception:
+                pass
+
+    def wait_ready(self, test_id: str, timeout: int = 30) -> bool:
+        """等某个 data-test-id 的元素出现在页面上（不要求可见）。"""
+        for _ in range(timeout):
+            try:
+                if self.driver.execute_script(
+                        'return !!document.querySelector(\'[data-test-id="\'+arguments[0]+\'"]\')',
+                        test_id):
+                    return True
+            except Exception:
+                pass
+            time.sleep(1)
+        return False
+
+    def _click_submit(self):
+        """点「Save and Continue」。点不到就直说，不要在 null 上调 click。
+
+        原来是 document.getElementById(...).click()，元素不在时抛的是
+        "Cannot read properties of null (reading 'click')" —— 这句话完全指不到
+        真正的原因（页面被系列流程带走了），排查时白绕了一圈。
+        """
+        ok = self.driver.execute_script("""
+            var e = document.getElementById(arguments[0]);
+            if (!e) return false;
+            e.scrollIntoView({block: 'center'}); e.click(); return true;
+        """, self.F_SUBMIT)
+        if not ok:
+            raise RuntimeError(
+                f"页面上找不到提交按钮 #{self.F_SUBMIT}，当前地址 "
+                f"{self.driver.current_url} —— 多半是这一步之前页面被带到别处了")
+
+    def _back_to_title(self, back_url: str, timeout: int = 40):
+        """确保回到书的详情页。系列流程会跳到独立的系列管理页。
+
+        先给 KDP 自己跳回来的机会（系列页的地址带 returnTo=<详情页>，点完保存
+        它通常会自己回去）；等不到就显式 driver.get 回去。回去之后还要等
+        提交按钮真的挂上来 —— 页面刚加载完 DOM 还在建，早一秒点就是 null。
+        """
+        def on_title():
+            try:
+                return ("/title-setup/" in self.driver.current_url
+                        and self.driver.execute_script(
+                            "return !!document.getElementById(arguments[0])",
+                            self.F_SUBMIT))
+            except Exception:
+                return False
+
+        for _ in range(timeout // 2):
+            if on_title():
+                return
+            time.sleep(2)
+        self.log(f"  · 系列流程把页面带走了，手动回到详情页")
+        try:
+            self.driver.get(back_url)
+        except Exception as exc:
+            self.log(f"  ⚠️ 回详情页失败（{exc}）")
+            return
+        for _ in range(timeout // 2):
+            if on_title():
+                self.log("  · 已回到详情页")
+                return
+            time.sleep(2)
+        self.log("  ⚠️ 回到详情页后没等到提交按钮，第 1 步可能提交不了")
 
     def _set_series_number(self, n: int):
         """填「这是系列第几本」。
@@ -1451,11 +1610,17 @@ class KDPBrowserUploader:
                 el.dispatchEvent(new Event('input',  {bubbles: true}));
                 el.dispatchEvent(new Event('change', {bubbles: true}));
             };
-            // 1) 可见的输入框优先：它才是页面真正读的那个
+            // 1) 可见的输入框优先：它才是页面真正读的那个。
+            //    只认「series number」这一个字段，而且必须排掉 is_series_ordered ——
+            //    那是阅读顺序的单选框。原来的正则 /series.*(number|order)/ 会命中它，
+            //    实测把卷号 1 写进了 data[is_series_ordered] 这个 radio 的 value 里，
+            //    日志还显示「已填」，看起来成功、其实动的是完全另一个设置。
             var vis = Array.prototype.slice.call(
                 document.querySelectorAll('input')).filter(function(e){
-                    return e.offsetParent && /series.*(number|order|num)/i.test(
-                        (e.id||'') + ' ' + (e.name||''));
+                    var key = (e.id || '') + ' ' + (e.name || '');
+                    if (/ordered/i.test(key)) return false;
+                    if (e.type === 'radio' || e.type === 'checkbox') return false;
+                    return e.offsetParent && /series[-_ ]?number/i.test(key);
                 })[0];
             if (vis) { vis.scrollIntoView({block:'center'}); fire(vis, want);
                        return {how: 'visible', id: vis.id || vis.name}; }
@@ -1473,39 +1638,104 @@ class KDPBrowserUploader:
         else:
             self.log(f"  ⚠️ 没找到卷号输入框，第 {n} 本的顺序要你在网页上补")
 
+    # 选系列弹层的真实结构（在页面上抓下来核对过的）：
+    #   [data-test-id="series-search-input"]   搜索框，里面是 input[name=series-search-input]
+    #   [data-test-id="series-search-button"]  搜索按钮
+    #   button[data-test-id^="series-search-result-"]  每条结果，尾巴是系列 ID
+    #   按钮文字 = 系列名 + "N live title(s)"，底部还有 ← Previous / Next → 分页
+    F_SERIES_SEARCH = '[data-test-id="series-search-input"] input'
+    F_SERIES_RESULT = 'button[data-test-id^="series-search-result-"]'
+
     def _select_existing_series(self, name: str) -> bool:
-        """第二本起：点「Select series」，在列表里挑出已经建好的那个系列。
+        """第二本起：点「Select series」，在弹层里挑出已经建好的那个系列。
 
         挑中返回 True；没找到返回 False，调用方会退回去走「建系列」那条路。
 
-        弹层里那份系列列表的 DOM 我没拿到，所以不写死结构：在可见元素里找
-        文字恰好等于系列名的那个来点。宁可认不出来退回去建，也不按「包含」
-        去匹配 —— 「Box Office Bluff」和「Box Office Bluff Origins」同时存在时，
-        包含匹配会把书挂到错的系列上，而那种错在商品页上很久才看得出来。
+        两件事必须做对，都是踩过才知道的：
+
+        1. 先用搜索框过滤，不要在列表里翻。弹层是分页的（底部有 Previous/Next），
+           系列一多，目标压根不在第一页，翻页找纯属自找麻烦。
+
+        2. 比较时忽略大小写。KDP 上显示的是小写的「box office bluff」，而我们
+           建的时候写的是「Box Office Bluff」—— 严格相等会落空，然后退回去重建，
+           同一个系列被建两遍。
+
+        但仍然要求【整个名字相等】，不用「包含」：「Box Office Bluff」和
+        「Box Office Bluff Origins」同时存在时，包含匹配会把书挂到错的系列上，
+        而那种错在商品页上很久才看得出来。
         """
         if not self._click_text("Select series", timeout=10):
             self.log("  · 页面上没有「Select series」，改走新建系列")
             return False
+
+        # 等弹层里的搜索框出现，再往里打字 —— 弹层是异步挂上来的
+        box = None
+        for _ in range(15):
+            try:
+                cand = self.driver.find_element(
+                    "css selector", self.F_SERIES_SEARCH)
+                if cand.is_displayed():
+                    box = cand
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        if box is None:
+            self.log("  ⚠️ 没等到系列搜索框，改走新建系列")
+            return False
+
+        # 用真实按键输入：这是 React 受控输入框，直接改 .value 不触发它的内部状态
+        box.clear()
+        box.send_keys(name)
+        time.sleep(0.5)
+        if not self.driver.execute_script("""
+            var b = document.querySelector('[data-test-id="series-search-button"]');
+            var t = b && (b.querySelector('input,button') || b);
+            if (!t) return false;
+            t.click(); return true;
+        """):
+            box.send_keys("")      # 搜索按钮找不到就回车提交表单
+        self.log(f"  · 搜了一下「{name}」")
         time.sleep(3)
-        if self._click_text(name, timeout=10):
-            self.log(f"  · 选中了已有的系列「{name}」")
-            # 弹层里通常还有一步确认，认不出来也不算失败：系列已经选上了
+
+        want = " ".join(name.split()).lower()
+        hit = self.driver.execute_script("""
+            var want = arguments[0], sel = arguments[1];
+            var norm = function(s){
+                return (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            };
+            // 按钮文字是「系列名 + N live title(s)」，把尾巴切掉再比
+            var nameOf = function(b){
+                return norm((b.textContent || '')
+                    .replace(/\\d+\\s*live\\s*title\\(s\\)/i, ''));
+            };
+            var out = [], btns = document.querySelectorAll(sel);
+            for (var i = 0; i < btns.length; i++) {
+                var n = nameOf(btns[i]);
+                out.push(n);
+                if (n === want) {
+                    btns[i].scrollIntoView({block: 'center'});
+                    btns[i].click();
+                    return {ok: true,
+                            id: (btns[i].getAttribute('data-test-id')||'')
+                                .replace('series-search-result-', '')};
+                }
+            }
+            return {ok: false, seen: out};
+        """, want, self.F_SERIES_RESULT) or {}
+
+        if hit.get("ok"):
+            self.log(f"  · 选中了已有的系列「{name}」（ID {hit.get('id')}）")
+            # 弹层里可能还有一步确认。认不出来也不算失败：系列已经选上了
             for label in ("Select", "Confirm", "Save", "Done"):
                 if self._click_text(label, timeout=2):
                     break
             return True
-        avail = self.driver.execute_script("""
-            var out = [], els = document.querySelectorAll('button, a, td, li, span');
-            for (var i = 0; i < els.length && out.length < 12; i++) {
-                var t = (els[i].textContent || '').trim();
-                if (t && t.length < 60 && els[i].offsetParent &&
-                    els[i].children.length === 0 && out.indexOf(t) < 0) out.push(t);
-            }
-            return out;
-        """) or []
-        self.log(f"  ⚠️ 列表里没找到「{name}」，改走新建系列。当前可见项：{avail[:8]}")
-        return False
 
+        seen = hit.get("seen") or []
+        self.log(f"  ⚠️ 搜「{name}」没搜到同名系列，改走新建系列。"
+                 f"搜索结果里的系列名：{seen[:8] if seen else '（一条都没有）'}")
+        return False
 
     def upload_ebook(self, meta: KDPMetadata, cancel_event=None,
                      do_publish: bool = False):
@@ -1541,18 +1771,22 @@ class KDPBrowserUploader:
         self.log("填写第 1 步（书名 / 作者 / 简介 / 关键词）…")
         self._fill_details(meta)
         self._pick_categories(meta.categories or self.DEFAULT_CATEGORIES)
-        # 系列在第 1 步这一页上，必须在提交之前设好 —— 提交之后页面就跳到
-        # 第 2 步了，「Add to series」入口不在那一页上
-        self._setup_series(meta)
 
         self.log("提交第 1 步…")
-        self.driver.execute_script("document.getElementById(arguments[0]).click()", self.F_SUBMIT)
+        self._click_submit()
         time.sleep(10)
         if "/content" not in self.driver.current_url:
             errs = [e.text.strip() for e in self.driver.find_elements(
                 "css selector", ".a-alert-content") if e.is_displayed() and e.text.strip()]
             raise RuntimeError("第 1 步没过：" + "; ".join(errs[:4]))
         self.log("第 1 步 Complete，草稿已建立。")
+
+        # 系列放在第 1 步之后做，不能放在提交之前。
+        # 「Go to series setup」会离开详情页，而回来只能靠重新加载 —— 还没提交的
+        # 表单一刷新就全空了。实测在提交前做系列，三本全部报
+        # 「Enter a title / Enter a description / Add the author's name…」。
+        # 提交之后数据已经落盘，再回详情页做系列、刷新多少次都不丢。
+        self._setup_series_on_draft(meta)
 
         self.log("上传正文与封面…")
         self._upload_files(meta)
@@ -1571,7 +1805,7 @@ class KDPBrowserUploader:
         # 不再走 Kindle 预览器（_run_previewer 保留着，暂时不调）：预览由 KDP 在
         # Save 之后自己生成，我们只要等它生成完。自己去点预览器既慢又多一处会崩的地方。
         self.log("提交第 2 步（KDP 会在这一步生成预览，慢，耐心等）…")
-        self.driver.execute_script("document.getElementById(arguments[0]).click()", self.F_SUBMIT)
+        self._click_submit()
         # 超时给足：这一步不是网络慢，是 KDP 在转格式 + 生成预览，几分钟到十几分钟都正常
         self._wait_step_done("/pricing", "第 2 步", timeout=1800)
 

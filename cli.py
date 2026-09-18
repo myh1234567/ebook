@@ -278,6 +278,15 @@ def run_kdp_upload(args):
     默认只建草稿，哪怕 settings 里 kdp_auto_publish 是开的 —— 这条命令就是用来
     试跑的，草稿在 KDP 网页上能直接删，发布出去撤不回来。真要发得显式 --publish。
     """
+    # publish 只留 目录/--vol/--dry-run/--go 四样，其余字段在这儿补默认值。
+    # 一律重传、不看 .kdp_uploaded：你明确敲了 publish 就是要传，跳过才是意外。
+    # 那个标记只在 adapt/batch 自动上架那条路上生效，防止改编重跑一次
+    # 就在 KDP 上多出一整套重复草稿。
+    if args.command == "publish":
+        args.redo = True
+        args.limit = 0
+        args.kpf = None          # 跟 settings 里的 kdp_make_kpf 走
+        args.proj = ""
     s = Settings.load() if hasattr(Settings, "load") else Settings()
     if SETTINGS_FILE.exists():
         try:
@@ -289,7 +298,11 @@ def run_kdp_upload(args):
 
     # 路径必须显式给。原来是「没给就取 output 下最近改动的那个」—— 多本书时那就是
     # 在猜，猜错就是把 B 书的卷传到 Amazon 上，而且每本里都有 Vol1、光看卷号分不出谁的。
-    proj = Path(args.proj).expanduser().resolve()
+    raw = getattr(args, "proj_pos", "") or getattr(args, "proj", "")
+    if not raw:
+        print("❌ 要给目录，例：python3 cli.py publish output/Box_Office_Bluff")
+        return
+    proj = Path(raw).expanduser().resolve()
     if not proj.exists():
         print(f"❌ 目录不存在：{proj}")
         return
@@ -335,8 +348,54 @@ def run_kdp_upload(args):
         print("\n（--dry-run：只看不传，没碰浏览器）")
         return
 
+    # 上传之前，把还没转过 KPF 的卷转掉。KPF 是本地排好版的成品，传上去 KDP
+    # 不再二次转换；没有就退回 DOCX，让 KDP 自己转。
+    # 默认行为跟 settings 里的 kdp_make_kpf 一致，命令行的 --kpf/--no-kpf 优先。
+    want_kpf = getattr(args, "kpf", None)
+    if want_kpf is None:
+        want_kpf = getattr(s, "kdp_make_kpf", False)
+    if want_kpf:
+        _ensure_kpf(books[:args.limit] if args.limit else books)
+
     print(run_kdp_autopost(s, proj, limit=args.limit, do_publish=args.publish,
                            redo=args.redo, only_vols=only))
+
+
+def _ensure_kpf(books):
+    """给还没有 KPF 的卷各转一份。转不了就跳过，上传会退回 DOCX。
+
+    放在上传之前而不是改编流水线里：改编那条路有 deliverables_fresh() 挡着，
+    物料齐全时整个导出阶段（含转 KPF）会被整段跳过 —— 而 KPF 不在交付清单里，
+    新鲜度检查察觉不到它缺，于是永远转不出来。实测就是这么漏掉的。
+    """
+    if sys.platform != "darwin" or not Path("/Applications/Kindle Create.app").exists():
+        print("   · 没装 Kindle Create（或不是 macOS），跳过 KPF，上传用 DOCX")
+        return
+    todo = []
+    for b in books:
+        docx = b / "01_English_Manuscript.docx"
+        if not docx.exists():
+            continue
+        have = sorted(b.glob("KPF/*.kpf")) + sorted(b.glob("*.kpf"))
+        if have and max(f.stat().st_mtime for f in have) >= docx.stat().st_mtime:
+            continue
+        todo.append((b, docx))
+    if not todo:
+        print("   · 每卷都已有 KPF 且不比母稿旧，跳过转换")
+        return
+    print(f"\n📗 要转 {len(todo)} 卷的 KPF，每卷约 3-4 分钟。"
+          f"期间 Kindle Create 会在前台被操作，别抢鼠标键盘。")
+    import kindle_create
+    kc = kindle_create.KindleCreate(log=lambda m: print(f"   {m}"))
+    for b, docx in todo:
+        meta = kdp_uploader.KDPMetadata.load_from_project_dir(b)
+        print(f"   —— {b.name} ——")
+        try:
+            kc.convert(docx=docx, out_dir=b,
+                       title=meta.title or b.name,
+                       author=f"{meta.author_first} {meta.author_last}".strip())
+        except Exception as exc:
+            print(f"   ⚠️ {b.name} 转 KPF 失败（{exc}），这一卷改传 DOCX")
 
 
 def run_chrome(args):
@@ -693,10 +752,16 @@ def main():
     # 7. 拿已经生成好的书去试上架（默认只建草稿）
     p_up = subparsers.add_parser(
         "kdp-upload", help="拿已经生成好的书去上架，不用重跑改编；默认只建草稿")
-    p_up.add_argument("--proj", type=str, required=True,
-                      help="要传的目录，必填。给书的目录就传它下面所有卷，"
+    p_up.add_argument("proj_pos", nargs="?", default="", metavar="目录",
+                      help="要传的目录。给书的目录就传它下面所有卷，"
                            "给某个卷目录就只传那一卷。例："
                            "output/Book1 或 output/Book1/Vol1_Xxx")
+    p_up.add_argument("--proj", type=str, default="",
+                      help="同上，老写法，跟位置参数二选一")
+    p_up.add_argument("--kpf", dest="kpf", action="store_true", default=None,
+                      help="上传前先用本地 Kindle Create 把没转过的卷转成 KPF")
+    p_up.add_argument("--no-kpf", dest="kpf", action="store_false",
+                      help="不转 KPF，直接传现成的 DOCX")
     p_up.add_argument("--vol", type=str, default="",
                       help="只传指定卷，比如 --vol 3 或 --vol 1,3,5")
     p_up.add_argument("--limit", type=int, default=0, help="只传前几本，试跑时填 1")
@@ -706,6 +771,21 @@ def main():
                       help="只列出要传哪几本并跑预检，不碰浏览器")
     p_up.add_argument("--publish", action="store_true",
                       help="真的点发布（撤不回来）。不给就只建草稿")
+
+    # 7b. publish：给个目录就走完上架。开关只留必要的三个 ——
+    #     它一律重传，不看 .kdp_uploaded 标记：你明确敲了这条命令就是要传，
+    #     跳过才是意外。那个标记只在 adapt/batch 自动上架那条路上生效，
+    #     防止改编重跑一次就在 KDP 上多出一整套重复草稿。
+    p_pub = subparsers.add_parser(
+        "publish", help="给个目录就走完上架：转 KPF -> 建草稿 -> （可选）发布")
+    p_pub.add_argument("proj_pos", nargs="?", default="", metavar="目录",
+                       help="书的目录，例 output/Box_Office_Bluff")
+    p_pub.add_argument("--vol", type=str, default="",
+                       help="只弄指定卷，如 --vol 1 或 --vol 1,3")
+    p_pub.add_argument("--dry-run", dest="dry_run", action="store_true",
+                       help="只列要传哪几本，不碰浏览器也不转 KPF")
+    p_pub.add_argument("--go", dest="publish", action="store_true",
+                       help="真的点发布（撤不回来）。不给就只建草稿")
 
     # 8. 把 Chrome 带调试端口重起，好让上架沿用你自己的登录态
     p_chrome = subparsers.add_parser(
@@ -740,7 +820,7 @@ def main():
         run_kdp_categories(args)
     elif args.command == "chrome":
         run_chrome(args)
-    elif args.command == "kdp-upload":
+    elif args.command in ("kdp-upload", "publish"):
         run_kdp_upload(args)
 
 

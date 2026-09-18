@@ -149,6 +149,33 @@ class KindleCreate:
         osa(f'tell application "{APP}" to activate')
         time.sleep(1.2)
 
+    def quit(self, grace: int = 8):
+        """关掉 Kindle Create。先好好说，说不听就强杀。
+
+        必须能强杀：导出完成后它停在「You are ready to publish」那一屏，
+        那一屏是模态的、会把正常的 quit 挡掉，于是 app 一直挂在那儿，
+        下一本永远等不到欢迎页 —— 实测第 2 卷就是这么超时的。
+        这时候 KPF 已经落盘，工程文件丢了也不影响交付，可以放心强杀。
+        """
+        osa(f'tell application "{APP}" to quit')
+        for _ in range(grace):
+            if not self.running():
+                return
+            time.sleep(1)
+        subprocess.run(["pkill", "-9", "-x", APP], check=False)
+        time.sleep(2)
+
+    def restart(self):
+        """关掉重开，保证从欢迎页开始。"""
+        if self.running():
+            self.quit()
+        subprocess.run(["open", "-a", APP], check=False)
+        for _ in range(30):
+            if self.running():
+                break
+            time.sleep(1)
+        self.activate()
+
     def press(self, name: str, window: str = "1") -> bool:
         ref = f"window {window}" if window == "1" else f'window "{window}"'
         out = osa(PROC + f'perform action "AXPress" of '
@@ -229,9 +256,13 @@ class KindleCreate:
         stem = docx.stem
 
         self.log(f"Kindle Create：{docx.name} -> KPF")
-        if not self.running():
-            subprocess.run(["open", "-a", APP], check=False)
-        self.activate()
+        # 每本都从重启开始，不管它现在是什么状态。
+        # 导出完成后它停在「You are ready to publish」那一屏，不是欢迎页，而且
+        # 那一屏是模态的、会把 quit 挡掉 —— 所以上一本转完它并没退出。
+        # 结果下一本一直等「Create new」等到超时（实测第 2 卷就是这么挂的）。
+        # 那一屏上有个 Close 可以点，但那又要多摸一套坐标；重启更省事也更可靠：
+        # KPF 已经落盘，工程文件我们不需要。
+        self.restart()
         if not self.wait_button("Create new", 60):
             raise KindleCreateError("Kindle Create 没停在欢迎页，先手工关掉它再重试")
 
@@ -357,8 +388,9 @@ class KindleCreate:
         self.log(f"  ✓ {kpf.name}（{kpf.stat().st_size / 1024 / 1024:.1f} MB）")
 
         if quit_after:
-            osa(f'tell application "{APP}" to quit')
-            time.sleep(2)
+            # 用 self.quit() 而不是裸 quit：这会儿正停在模态的
+            # 「You are ready to publish」上，裸 quit 关不掉
+            self.quit()
         return kpf
 
     def running(self) -> bool:
