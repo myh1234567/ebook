@@ -238,6 +238,13 @@ def run_kdp_autopost(settings, proj_dir, limit: int = 0,
         if limit:
             todo = todo[:limit]
 
+        # 转 KPF 得在这儿补一次，不能指望改编流程转好。deliverables_fresh() 的
+        # 清单里没有 KPF，物料齐全时整个导出阶段（含转 KPF）被整段跳过，它察觉
+        # 不到 KPF 缺 —— `cli.py kdp-upload` 那条路早就补了这一步（见 _ensure_kpf
+        # 的注释），batch/adapt 自动上架这条一直漏着，所以自动传的永远是 DOCX。
+        if getattr(settings, "kdp_make_kpf", False):
+            _ensure_kpf(todo)
+
         do_pub = (bool(getattr(settings, "kdp_auto_publish", False))
                   if do_publish is None else bool(do_publish))
         print(f"\n📤 开始自动上架：{len(todo)} 本"
