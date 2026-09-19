@@ -1043,7 +1043,19 @@ Per-chapter record:
             except Exception as exc:
                 self.log(f"⚠️ 全书规划解析失败（{exc}）")
         if not plan.get("volumes") or not plan.get("people"):
-            self.log("⚠️ 模型没给出可用的分卷或名册，这一步失败了。")
+            # 这一步失败会把整本书带偏（全书顶着空名册跑，各章自己编名），
+            # 但以前只留下一行「失败了」，模型原样回的内容当场丢掉 ——
+            # 事后完全分不清是没回 JSON、回了但缺字段、还是输出被截断。
+            # 落盘留证，并说清缺的是哪半边。
+            bad = proj_dir / "13_Story_Plan.failed.txt"
+            try:
+                bad.write_text(raw, "utf-8")
+            except Exception:
+                pass
+            miss = "、".join(k for k in ("volumes", "people") if not plan.get(k))
+            self.log(f"⚠️ 模型没给出可用的分卷或名册（缺 {miss}），这一步失败了。"
+                     f"模型回了 {len(raw)} 字符，已原样存进 {bad.name} 供排查。"
+                     f"开头 200 字符：{raw[:200]!r}")
             return {}
 
         # 分卷必须严丝合缝盖满全书。缺一段就是整段章节没人认领，
@@ -2123,6 +2135,16 @@ Return JSON with exactly these keys:
                     (proj_dir / "12_Name_Registry.json").read_text("utf-8")))
             except Exception:
                 name_registry = {}
+            if not name_registry:
+                # 退无可退时必须停。带着空名册往下跑的代价是整本书：每章自己现起
+                # 英文名，同一个角色在不同章叫不同名字，而这些都已经写进
+                # _chapters/ 缓存 —— 事后补上名册也改不回来，只能整本重跑。
+                # 实测一次 227 章烧掉 10 小时，最后质检报出 923 个表外人名。
+                raise RuntimeError(
+                    "全书规划失败，也没有可用的 12_Name_Registry.json。"
+                    "这时候继续改编，每章会各自编名，成书里同一个角色会有好几个"
+                    "英文名，且事后无法修正（_chapters/ 缓存整份复用）。"
+                    "请重跑这一步 —— _pass1/ 缓存还在，不用重读全书。")
             self.log("⚠️ 全书规划没拿到名册，退回已落盘的映射表继续。")
 
         if progress_cb:
@@ -2333,9 +2355,27 @@ Return JSON with exactly these keys:
         # 而它恰恰是最贵的一步 —— python-docx 把整个文档树建在内存里，
         # 2450 章的真实英文长文要涨到几个 G，8G 的机器会被拖进重度交换甚至 OOM。
         # 分卷的 docx/epub 每本只有几百章，轻松得多。
-        whole_book = not getattr(self.config, "split_volumes", True)
+        #
+        # 但跳过的前提是分卷真顶得上。只看 split_volumes 这个开关的话，规划那一步
+        # 没给出分卷方案时就两头落空：全书版被跳过、分卷无卷可导，整本书一个正文
+        # 文件都没有，几百分钟跑完到上架预检才发现「未找到正文文件」。
+        # 所以先把卷算出来，按「有没有卷」决定，而不是按开关决定。
+        # 注意别叫 vols —— 上面 brief_for/notes_for 两个闭包捕获着那个同名变量，
+        # 而它装的是规划原样的 {from,to}，和这里导出用的 {n,start,end} 不是一个形状。
+        export_vols = []
+        if getattr(self.config, "split_volumes", True) and not chapter_range:
+            # 分卷点用第二遍通读时定的那套，不再另切一次 —— 各章的卷末收束、
+            # 卷首重新立场景都是按这套写的，导出时换一套切，钩子就落在错的章上。
+            export_vols = [{"n": i, "start": int(v["from"]), "end": int(v["to"]),
+                            "subtitle": v.get("title") or f"Book {i}",
+                            "arc": v.get("arc", "")}
+                           for i, v in enumerate(story_plan.get("volumes") or [], 1)]
+            if not export_vols:
+                self.log("⚠️ 全书规划里没有分卷方案，这一本改出全书版正文（01/07），不分卷。")
+        whole_book = not export_vols
         if not whole_book:
-            self.log("已开分卷，跳过全书版正文。分卷各自的正文照常生成。")
+            self.log(f"已开分卷（{len(export_vols)} 卷），跳过全书版正文。"
+                     f"分卷各自的正文照常生成。")
 
         # 01_English_Manuscript.docx
         manuscript_path = proj_dir / "01_English_Manuscript.docx"
@@ -2512,23 +2552,20 @@ Author: {self.config.author_name}
 
         self.log(f"全部改编与出版物料已就绪！项目保存在: {proj_dir}")
         # 分卷：把全书切成若干本独立上架的英文书
-        if getattr(self.config, "split_volumes", True) and not chapter_range:
+        # export_vols 在导出交付文件那一步就算好了（没有卷时上面已经改出全书版正文）
+        if export_vols:
             try:
-                # 分卷点用第二遍通读时定的那套，不再另切一次 —— 各章的卷末收束、
-                # 卷首重新立场景都是按这套写的，导出时换一套切，钩子就落在错的章上。
-                vols = [{"n": i, "start": int(v["from"]), "end": int(v["to"]),
-                         "subtitle": v.get("title") or f"Book {i}",
-                         "arc": v.get("arc", "")}
-                        for i, v in enumerate(story_plan.get("volumes") or [], 1)]
-                if not vols:
-                    raise RuntimeError("全书规划里没有分卷方案，跳过分卷（全书版已生成）")
                 stage("导出各卷物料")
-                made = self.export_volumes(vols, adapted_chapters, bible_md,
+                made = self.export_volumes(export_vols, adapted_chapters, bible_md,
                                            proj_dir, proj_dir / "05_Ebook_Cover.png")
                 self.log(f"分卷完成：{len(made)} 卷，各自可独立上架。"
                          f"每卷目录里有自己的 01/03/05/07 四个文件。")
             except Exception as exc:
-                # 分卷失败不能把整本的交付物料带掉 —— 全书版已经生成好了
-                self.log(f"分卷这步出错（{exc}），全书版物料不受影响。")
+                # 出版文案、封面、质检报告都已落盘，但正文只在卷目录里出 ——
+                # 分卷开着时全书版正文是特意跳过的，所以这里挂了就一个正文都没有，
+                # 上架预检会拦下来。说清楚，别让人以为只是少了分卷。
+                self.log(f"⚠️ 分卷导出失败（{exc}）。出版文案和封面已就绪，"
+                         f"但正文（01/07）只在卷目录里生成，这一本现在没有可上架的正文，"
+                         f"重跑会接着导出。")
 
         return proj_dir
