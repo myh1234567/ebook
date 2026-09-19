@@ -1303,12 +1303,17 @@ class KDPBrowserUploader:
 
         self.log("新建 Kindle 电子书…")
         self.driver.get("https://kdp.amazon.com/en_US/create")
-        time.sleep(3)
-        btn = [e for e in self.driver.find_elements("xpath", "//a|//button")
-               if (e.text or "").strip() == "Create eBook"]
-        if not btn:
-            raise RuntimeError("没找到「Create eBook」入口，KDP 页面可能改版了")
-        btn[0].click()
+        # 这里原本另写了一套 xpath 找按钮，比 _click_text 脆三处，也是它先挂的原因：
+        # 固定等 3 秒（页面没加载完就判死）、用 .text（元素要滚动才可见时返回空串）、
+        # 只看 //a|//button（Amazon 的按钮文字常在 span.a-button-text 里）。
+        # _click_text 这三样都处理了，全文件其它按钮都走它，没理由这里自己来一套。
+        if not self._click_text("Create eBook", timeout=20):
+            # 光说「没找到」查不下去 —— 把页面上实际能点的东西一起报出来，
+            # 是文案改了还是根本没到这个页面（被重定向到登录），一眼就能分辨。
+            raise RuntimeError(
+                "没找到「Create eBook」入口，KDP 页面可能改版了。"
+                f"当前 URL：{self.driver.current_url}；"
+                f"这个页面上能点的是：{self._clickable_labels()}")
         time.sleep(6)
         return True
 
@@ -1351,6 +1356,29 @@ class KDPBrowserUploader:
                 return True
             time.sleep(1)
         return False
+
+    def _clickable_labels(self, limit: int = 40) -> List[str]:
+        """页面上所有可见可点元素的文字。只在点不到东西、要报错时调用。
+
+        KDP 改文案的频率不低，而「没找到 X」这种报错本身查不出任何东西 ——
+        把当时页面上实际有什么一起报出来，下次就不用再复现一遍才知道改成了什么。
+        """
+        try:
+            return self.driver.execute_script("""
+                var out = [], seen = {};
+                var els = document.querySelectorAll('button, a, span.a-button-text');
+                for (var i = 0; i < els.length && out.length < arguments[0]; i++) {
+                    var e = els[i];
+                    if (!e.offsetParent) continue;               // 不可见的跳过
+                    var t = (e.textContent || '').trim();
+                    if (!t || t.length > 60 || seen[t]) continue;
+                    seen[t] = 1;
+                    out.push(t);
+                }
+                return out;
+            """, limit)
+        except Exception as exc:
+            return [f"（读不出来：{exc}）"]
 
     def _setup_series(self, meta: "KDPMetadata"):
         """把这本书加进系列。系列不存在就当场建一个。
