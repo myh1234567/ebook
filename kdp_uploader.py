@@ -532,15 +532,55 @@ class KDPBrowserUploader:
     F_MANUSCRIPT = "data-assets-interior-file-upload-AjaxInput"
     F_COVER = "data-assets-cover-file-upload-AjaxInput"
 
-    def _type(self, elem_id: str, value: str, label: str):
-        """填一个输入框并回读校验。填不进去就抛错——静默失败比不填更坑人。"""
-        el = self.driver.find_element("id", elem_id)
+    def _type(self, elem_id: str, value: str, label: str, timeout: int = 20):
+        """填一个输入框并回读校验。填不进去就抛错——静默失败比不填更坑人。
+
+        先等它真的可输入再敲。页面是 React 渲染的，元素进 DOM 和它能接受输入
+        之间有一段空窗，上一步点完 Create eBook 只固定等 6 秒赌不过去 ——
+        实测就是在这段空窗里报 element not interactable，而且那个报错既不说
+        是哪个字段，也不说当时元素什么状态，光看日志查不下去。
+        """
+        el = None
+        for _ in range(timeout):
+            el = next((e for e in self.driver.find_elements("id", elem_id)
+                       if e.is_displayed() and e.is_enabled()), None)
+            if el:
+                break
+            time.sleep(1)
+        if el is None:
+            raise RuntimeError(
+                f"{label}：#{elem_id} 等了 {timeout} 秒仍不可输入。"
+                f"当前 URL：{self.driver.current_url}；"
+                f"该 id 的元素状态：{self._elem_states(elem_id)}")
         el.clear()
         el.send_keys(value)
         got = (el.get_attribute("value") or "").strip()
         if got != value.strip():
             raise RuntimeError(f"{label} 没填进去（#{elem_id} 实际值：{got[:40]!r}）")
         self.log(f"  ✓ {label}")
+
+    def _elem_states(self, elem_id: str) -> list:
+        """某个 id 在页面上的所有元素分别是什么状态。只在填不进去、要报错时调用。
+
+        同一个 id 可能命中好几个（模板壳子 + 真正的输入框），「不可交互」到底是
+        还没渲染完、被藏起来了、还是 readonly，光靠异常本身分不出来。
+        """
+        try:
+            return self.driver.execute_script("""
+                var out = [];
+                document.querySelectorAll('[id="' + arguments[0] + '"]').forEach(
+                  function(e){
+                    var s = window.getComputedStyle(e);
+                    out.push({tag: e.tagName, type: e.type || null,
+                              display: s.display, visibility: s.visibility,
+                              disabled: e.disabled === true,
+                              readOnly: e.readOnly === true,
+                              可见: !!e.offsetParent});
+                  });
+                return out;
+            """, elem_id)
+        except Exception as exc:
+            return [f"（读不出来：{exc}）"]
 
     def _fill_details(self, meta: "KDPMetadata"):
         """第 1 步：书名、作者、简介、关键词、分类。"""
